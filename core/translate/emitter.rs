@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::usize;
 
+use sqlite3_parser::ast;
+
 use crate::schema::{BTreeTable, Column, PseudoTable, Table};
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::types::{OwnedRecord, OwnedValue};
@@ -35,14 +37,14 @@ pub trait Emitter {
         program: &mut ProgramBuilder,
         referenced_tables: &[(Rc<BTreeTable>, String)],
         metadata: &mut Metadata,
-        cursor_override: Option<usize>,
+        cursor_override: Option<&SortCursorOverride>,
     ) -> Result<usize>;
     fn result_row(
         &mut self,
         program: &mut ProgramBuilder,
         referenced_tables: &[(Rc<BTreeTable>, String)],
         metadata: &mut Metadata,
-        cursor_override: Option<usize>,
+        cursor_override: Option<&SortCursorOverride>,
     ) -> Result<()>;
 }
 
@@ -68,6 +70,32 @@ pub struct SortMetadata {
     pub sorter_data_label: BranchOffset,
     // label for the instruction immediately following SorterNext; SorterSort will jump here in case there is no data
     pub done_label: BranchOffset,
+    // register where the sorter data is inserted and later retrieved from
+    pub sorter_data_register: usize,
+}
+
+#[derive(Debug)]
+pub struct GroupByMetadata {
+    pub sort_cursor: usize,
+    pub subroutine_accumulator_clear_label: BranchOffset,
+    pub subroutine_accumulator_clear_return_offset_register: usize,
+    pub subroutine_accumulator_output_label: BranchOffset,
+    pub subroutine_accumulator_output_return_offset_register: usize,
+    pub accumulator_indicator_set_true_label: BranchOffset,
+    pub sorter_data_label: BranchOffset,
+    pub sorter_key_register: usize,
+    pub done_label: BranchOffset,
+    pub abort_flag_register: usize,
+    pub data_in_accumulator_indicator_register: usize,
+    pub group_exprs_temp_register: usize,
+    pub comparison_register: usize,
+}
+
+#[derive(Debug)]
+pub struct SortCursorOverride {
+    pub cursor_id: usize,
+    pub pseudo_table: Table,
+    pub sort_key_len: usize,
 }
 
 #[derive(Debug, Default)]
@@ -82,6 +110,8 @@ pub struct Metadata {
     rewind_labels: Vec<BranchOffset>,
     // mapping between Aggregation operator id and the register that holds the start of the aggregation result
     aggregation_start_registers: HashMap<usize, usize>,
+    // mapping between Aggregation operator id and associated metadata (if the aggregation has a group by clause)
+    group_bys: HashMap<usize, GroupByMetadata>,
     // mapping between Order operator id and associated metadata
     sorts: HashMap<usize, SortMetadata>,
     // mapping between Join operator id and associated metadata (for left joins only)
@@ -118,6 +148,7 @@ impl Emitter for Operator {
         m: &mut Metadata,
         referenced_tables: &[(Rc<BTreeTable>, String)],
     ) -> Result<OpStepResult> {
+        let current_operator_column_count = self.column_count(referenced_tables);
         match self {
             Operator::Scan {
                 table,
@@ -408,9 +439,447 @@ impl Emitter for Operator {
                 id,
                 source,
                 aggregates,
+                group_by,
                 step,
             } => {
                 *step += 1;
+
+                // Group by aggregation eg. SELECT a, b, sum(c) FROM t GROUP BY a, b
+                if let Some(group_by) = group_by {
+                    const GROUP_BY_INIT: usize = 1;
+                    const GROUP_BY_INSERT_INTO_SORTER: usize = 2;
+                    const GROUP_BY_SORT_AND_COMPARE: usize = 3;
+                    const GROUP_BY_PREPARE_ROW: usize = 4;
+                    const GROUP_BY_CLEAR_ACCUMULATOR_SUBROUTINE: usize = 5;
+                    match *step {
+                        GROUP_BY_INIT => {
+                            let agg_final_label = program.allocate_label();
+                            m.termination_labels.push(agg_final_label);
+                            let num_aggs = aggregates.len();
+
+                            let sort_cursor = program.alloc_cursor_id(None, None);
+
+                            let abort_flag_register = program.alloc_register();
+                            let data_in_accumulator_indicator_register = program.alloc_register();
+                            let comparison_start_reg = program.alloc_registers(group_by.len());
+                            let group_exprs_temp_register = program.alloc_registers(group_by.len());
+                            let agg_exprs_start_reg = program.alloc_registers(num_aggs);
+                            m.aggregation_start_registers
+                                .insert(*id, agg_exprs_start_reg);
+                            let sorter_key_register = program.alloc_register();
+
+                            let subroutine_accumulator_clear_label = program.allocate_label();
+                            let subroutine_accumulator_output_label = program.allocate_label();
+                            let sorter_data_label = program.allocate_label();
+                            let done_label = program.allocate_label();
+
+                            let mut order = Vec::new();
+                            const ASCENDING: i64 = 0;
+                            for _ in group_by.iter() {
+                                order.push(OwnedValue::Integer(ASCENDING as i64));
+                            }
+                            program.emit_insn(Insn::SorterOpen {
+                                cursor_id: sort_cursor,
+                                columns: current_operator_column_count,
+                                order: OwnedRecord::new(order),
+                            });
+
+                            program.add_comment(program.offset(), "clear group by abort flag");
+                            program.emit_insn(Insn::Integer {
+                                value: 0,
+                                dest: abort_flag_register,
+                            });
+
+                            program.add_comment(
+                                program.offset(),
+                                "initialize group by comparison registers to NULL",
+                            );
+                            program.emit_insn(Insn::Null {
+                                dest: comparison_start_reg,
+                                dest_end: if group_by.len() > 1 {
+                                    Some(comparison_start_reg + group_by.len() - 1)
+                                } else {
+                                    None
+                                },
+                            });
+
+                            program.add_comment(
+                                program.offset(),
+                                "go to clear accumulator subroutine",
+                            );
+
+                            let subroutine_accumulator_clear_return_offset_register =
+                                program.alloc_register();
+                            program.emit_insn_with_label_dependency(
+                                Insn::Gosub {
+                                    target_pc: subroutine_accumulator_clear_label,
+                                    return_reg: subroutine_accumulator_clear_return_offset_register,
+                                },
+                                subroutine_accumulator_clear_label,
+                            );
+
+                            m.group_bys.insert(
+                                *id,
+                                GroupByMetadata {
+                                    sort_cursor,
+                                    subroutine_accumulator_clear_label,
+                                    subroutine_accumulator_clear_return_offset_register,
+                                    subroutine_accumulator_output_label,
+                                    subroutine_accumulator_output_return_offset_register: program
+                                        .alloc_register(),
+                                    accumulator_indicator_set_true_label: program.allocate_label(),
+                                    sorter_data_label,
+                                    done_label,
+                                    abort_flag_register,
+                                    data_in_accumulator_indicator_register,
+                                    group_exprs_temp_register,
+                                    comparison_register: comparison_start_reg,
+                                    sorter_key_register,
+                                },
+                            );
+
+                            loop {
+                                match source.step(program, m, referenced_tables)? {
+                                    OpStepResult::Continue => continue,
+                                    OpStepResult::ReadyToEmit => {
+                                        return Ok(OpStepResult::Continue);
+                                    }
+                                    OpStepResult::Done => {
+                                        return Ok(OpStepResult::Done);
+                                    }
+                                }
+                            }
+                        }
+                        GROUP_BY_INSERT_INTO_SORTER => {
+                            let sort_keys_count = group_by.len();
+                            let start_reg = program.alloc_registers(current_operator_column_count);
+                            for (i, expr) in group_by.iter().enumerate() {
+                                let key_reg = start_reg + i;
+                                translate_expr(
+                                    program,
+                                    Some(referenced_tables),
+                                    expr,
+                                    key_reg,
+                                    None,
+                                )?;
+                            }
+                            for (i, agg) in aggregates.iter().enumerate() {
+                                let expr = &agg.args[0]; // TODO hakhackhachkachkachkachk hack hack
+                                let agg_reg = start_reg + sort_keys_count + i;
+                                translate_expr(
+                                    program,
+                                    Some(referenced_tables),
+                                    expr,
+                                    agg_reg,
+                                    None,
+                                )?;
+                            }
+
+                            let group_by_metadata = m.group_bys.get(id).unwrap();
+
+                            program.emit_insn(Insn::MakeRecord {
+                                start_reg,
+                                count: current_operator_column_count,
+                                dest_reg: group_by_metadata.sorter_key_register,
+                            });
+
+                            let group_by_metadata = m.group_bys.get(id).unwrap();
+                            program.emit_insn(Insn::SorterInsert {
+                                cursor_id: group_by_metadata.sort_cursor,
+                                record_reg: group_by_metadata.sorter_key_register,
+                            });
+
+                            return Ok(OpStepResult::Continue);
+                        }
+                        GROUP_BY_SORT_AND_COMPARE => {
+                            loop {
+                                match source.step(program, m, referenced_tables)? {
+                                    OpStepResult::Done => {
+                                        break;
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            }
+
+                            let group_by_metadata = m.group_bys.get_mut(id).unwrap();
+
+                            let comparison_register = group_by_metadata.comparison_register;
+                            let subroutine_accumulator_output_return_offset_register =
+                                group_by_metadata
+                                    .subroutine_accumulator_output_return_offset_register;
+                            let subroutine_accumulator_output_label =
+                                group_by_metadata.subroutine_accumulator_output_label;
+                            let subroutine_accumulator_clear_return_offset_register =
+                                group_by_metadata
+                                    .subroutine_accumulator_clear_return_offset_register;
+                            let subroutine_accumulator_clear_label =
+                                group_by_metadata.subroutine_accumulator_clear_label;
+                            let data_in_accumulator_indicator_register =
+                                group_by_metadata.data_in_accumulator_indicator_register;
+                            let accumulator_indicator_set_true_label =
+                                group_by_metadata.accumulator_indicator_set_true_label;
+                            let group_exprs_temp_register =
+                                group_by_metadata.group_exprs_temp_register;
+                            let halt_label = *m.termination_labels.first().unwrap();
+                            let abort_flag_register = group_by_metadata.abort_flag_register;
+                            let sorter_key_register = group_by_metadata.sorter_key_register;
+
+                            let mut column_names =
+                                Vec::with_capacity(current_operator_column_count);
+                            for expr in group_by
+                                .iter()
+                                .chain(aggregates.iter().map(|agg| &agg.args[0]))
+                            // FIXME: just blindly taking the first arg is a hack
+                            {
+                                // FIXME: need a more robust way to determine column names
+                                column_names.push(match expr {
+                                    ast::Expr::Id(ident) => ident.0.clone(),
+                                    ast::Expr::Qualified(tbl, ident) => {
+                                        format!("{}.{}", tbl.0, ident.0)
+                                    }
+                                    _ => "expr".to_string(),
+                                });
+                            }
+                            let pseudo_columns = column_names
+                                .iter()
+                                .map(|name| Column {
+                                    name: name.clone(),
+                                    primary_key: false,
+                                    ty: crate::schema::Type::Null,
+                                })
+                                .collect::<Vec<_>>();
+
+                            let pseudo_cursor = program.alloc_cursor_id(
+                                None,
+                                Some(Table::Pseudo(Rc::new(PseudoTable {
+                                    columns: pseudo_columns,
+                                }))),
+                            );
+
+                            program.emit_insn(Insn::OpenPseudo {
+                                cursor_id: pseudo_cursor,
+                                content_reg: sorter_key_register,
+                                num_fields: current_operator_column_count,
+                            });
+
+                            let group_by_metadata = m.group_bys.get(id).unwrap();
+                            program.emit_insn_with_label_dependency(
+                                Insn::SorterSort {
+                                    cursor_id: group_by_metadata.sort_cursor,
+                                    pc_if_empty: group_by_metadata.done_label,
+                                },
+                                group_by_metadata.done_label,
+                            );
+
+                            program.defer_label_resolution(
+                                group_by_metadata.sorter_data_label,
+                                program.offset() as usize,
+                            );
+                            program.emit_insn(Insn::SorterData {
+                                cursor_id: group_by_metadata.sort_cursor,
+                                dest_reg: group_by_metadata.sorter_key_register,
+                                pseudo_cursor,
+                            });
+
+                            let groups_start_reg = program.alloc_registers(group_by.len());
+                            for (i, expr) in group_by.iter().enumerate() {
+                                let group_reg = groups_start_reg + i;
+                                translate_expr(
+                                    program,
+                                    Some(referenced_tables),
+                                    expr,
+                                    group_reg,
+                                    Some(pseudo_cursor),
+                                )?;
+                            }
+
+                            program.emit_insn(Insn::Compare {
+                                start_reg_a: comparison_register,
+                                start_reg_b: groups_start_reg,
+                                count: group_by.len(),
+                            });
+
+                            let agg_step_label = program.allocate_label();
+
+                            program.emit_insn_with_label_dependency(
+                                Insn::Jump {
+                                    target_pc_lt: program.offset() + 1,
+                                    target_pc_eq: agg_step_label,
+                                    target_pc_gt: program.offset() + 1,
+                                },
+                                agg_step_label,
+                            );
+
+                            program.emit_insn(Insn::Move {
+                                source_reg: groups_start_reg,
+                                dest_reg: comparison_register,
+                                count: group_by.len(),
+                            });
+
+                            program.emit_insn_with_label_dependency(
+                                Insn::Gosub {
+                                    target_pc: subroutine_accumulator_output_label,
+                                    return_reg:
+                                        subroutine_accumulator_output_return_offset_register,
+                                },
+                                subroutine_accumulator_output_label,
+                            );
+
+                            // 22      IfPos          2     45    0                    0   if r[2]>0 then r[2]-=0, goto 45; check abort flag
+                            // 23      Gosub          4     42    0                    0   reset accumulator
+                            //
+
+                            program.emit_insn_with_label_dependency(
+                                Insn::IfPos {
+                                    reg: abort_flag_register,
+                                    target_pc: halt_label,
+                                    decrement_by: 0,
+                                },
+                                m.termination_labels[0],
+                            );
+
+                            program.emit_insn_with_label_dependency(
+                                Insn::Gosub {
+                                    target_pc: subroutine_accumulator_clear_label,
+                                    return_reg: subroutine_accumulator_clear_return_offset_register,
+                                },
+                                subroutine_accumulator_clear_label,
+                            );
+
+                            program.resolve_label(agg_step_label, program.offset());
+                            let start_reg = m.aggregation_start_registers.get(id).unwrap();
+                            for (i, agg) in aggregates.iter().enumerate() {
+                                let agg_result_reg = start_reg + i;
+                                translate_aggregation(
+                                    program,
+                                    referenced_tables,
+                                    agg,
+                                    agg_result_reg,
+                                    Some(pseudo_cursor),
+                                )?;
+                            }
+
+                            program.emit_insn_with_label_dependency(
+                                Insn::If {
+                                    target_pc: accumulator_indicator_set_true_label,
+                                    reg: data_in_accumulator_indicator_register,
+                                    null_reg: 0, // unused in this case
+                                },
+                                accumulator_indicator_set_true_label,
+                            );
+
+                            for (i, expr) in group_by.iter().enumerate() {
+                                let key_reg = group_exprs_temp_register + i;
+                                translate_expr(
+                                    program,
+                                    Some(referenced_tables),
+                                    expr,
+                                    key_reg,
+                                    Some(pseudo_cursor),
+                                )?;
+                            }
+
+                            program.resolve_label(
+                                accumulator_indicator_set_true_label,
+                                program.offset(),
+                            );
+                            program.add_comment(program.offset(), "indicate data in accumulator");
+                            program.emit_insn(Insn::Integer {
+                                value: 1,
+                                dest: data_in_accumulator_indicator_register,
+                            });
+
+                            return Ok(OpStepResult::Continue);
+                        }
+                        GROUP_BY_PREPARE_ROW => {
+                            let group_by_metadata = m.group_bys.get(id).unwrap();
+                            program.emit_insn_with_label_dependency(
+                                Insn::SorterNext {
+                                    cursor_id: group_by_metadata.sort_cursor,
+                                    pc_if_next: group_by_metadata.sorter_data_label,
+                                },
+                                group_by_metadata.sorter_data_label,
+                            );
+
+                            program.resolve_label(group_by_metadata.done_label, program.offset());
+
+                            program.emit_insn_with_label_dependency(
+                                Insn::Gosub {
+                                    target_pc: group_by_metadata
+                                        .subroutine_accumulator_output_label,
+                                    return_reg: group_by_metadata
+                                        .subroutine_accumulator_output_return_offset_register,
+                                },
+                                group_by_metadata.subroutine_accumulator_output_label,
+                            );
+                            program.emit_insn_with_label_dependency(
+                                Insn::Goto {
+                                    target_pc: m.termination_labels[0],
+                                },
+                                m.termination_labels[0],
+                            );
+                            program.emit_insn(Insn::Integer {
+                                value: 1,
+                                dest: group_by_metadata.abort_flag_register,
+                            });
+                            program.emit_insn(Insn::Return {
+                                return_reg: group_by_metadata
+                                    .subroutine_accumulator_output_return_offset_register,
+                            });
+
+                            program.resolve_label(
+                                group_by_metadata.subroutine_accumulator_output_label,
+                                program.offset(),
+                            );
+                            program.emit_insn_with_label_dependency(
+                                Insn::IfPos {
+                                    reg: group_by_metadata.data_in_accumulator_indicator_register,
+                                    target_pc: m.termination_labels[1],
+                                    decrement_by: 0,
+                                },
+                                m.termination_labels[1],
+                            );
+                            program.emit_insn(Insn::Return {
+                                return_reg: group_by_metadata
+                                    .subroutine_accumulator_output_return_offset_register,
+                            });
+
+                            return Ok(OpStepResult::ReadyToEmit);
+                        }
+                        GROUP_BY_CLEAR_ACCUMULATOR_SUBROUTINE => {
+                            let group_by_metadata = m.group_bys.get(id).unwrap();
+                            program.emit_insn(Insn::Return {
+                                return_reg: group_by_metadata
+                                    .subroutine_accumulator_output_return_offset_register,
+                            });
+
+                            program.resolve_label(
+                                group_by_metadata.subroutine_accumulator_clear_label,
+                                program.offset(),
+                            );
+                            let start_reg = group_by_metadata.group_exprs_temp_register;
+                            program.emit_insn(Insn::Null {
+                                dest: start_reg,
+                                dest_end: Some(start_reg + group_by.len() + aggregates.len() - 1),
+                            });
+
+                            program.emit_insn(Insn::Integer {
+                                value: 0,
+                                dest: group_by_metadata.data_in_accumulator_indicator_register,
+                            });
+                            program.emit_insn(Insn::Return {
+                                return_reg: group_by_metadata
+                                    .subroutine_accumulator_clear_return_offset_register,
+                            });
+                        }
+                        _ => {
+                            return Ok(OpStepResult::Done);
+                        }
+                    }
+                }
+
+                // Non-grouped aggregation e.g. SELECT COUNT(*) FROM t
+
                 const AGGREGATE_INIT: usize = 1;
                 const AGGREGATE_WAIT_UNTIL_SOURCE_READY: usize = 2;
                 match *step {
@@ -479,6 +948,7 @@ impl Emitter for Operator {
                             SortMetadata {
                                 sort_cursor,
                                 pseudo_table_cursor: usize::MAX, // will be set later
+                                sorter_data_register: program.alloc_register(),
                                 sorter_data_label: program.allocate_label(),
                                 done_label: program.allocate_label(),
                             },
@@ -515,17 +985,16 @@ impl Emitter for Operator {
                         }
                         source.result_columns(program, referenced_tables, m, None)?;
 
-                        let dest = program.alloc_register();
+                        let sort_metadata = m.sorts.get_mut(id).unwrap();
                         program.emit_insn(Insn::MakeRecord {
                             start_reg,
                             count: sort_keys_count + source_cols_count,
-                            dest_reg: dest,
+                            dest_reg: sort_metadata.sorter_data_register,
                         });
 
-                        let sort_metadata = m.sorts.get_mut(id).unwrap();
                         program.emit_insn(Insn::SorterInsert {
                             cursor_id: sort_metadata.sort_cursor,
-                            record_reg: dest,
+                            record_reg: sort_metadata.sorter_data_register,
                         });
 
                         Ok(OpStepResult::Continue)
@@ -540,14 +1009,23 @@ impl Emitter for Operator {
                             }
                         }
                         let column_names = source.column_names();
-                        let pseudo_columns = column_names
-                            .iter()
-                            .map(|name| Column {
+                        let mut pseudo_columns = vec![];
+                        for (i, _) in key.iter().enumerate() {
+                            pseudo_columns.push(Column {
+                                name: format!("sort_key_{}", i),
+                                primary_key: false,
+                                ty: crate::schema::Type::Null,
+                            });
+                        }
+                        for name in column_names {
+                            pseudo_columns.push(Column {
                                 name: name.clone(),
                                 primary_key: false,
                                 ty: crate::schema::Type::Null,
-                            })
-                            .collect::<Vec<_>>();
+                            });
+                        }
+
+                        let num_fields = pseudo_columns.len();
 
                         let pseudo_cursor = program.alloc_cursor_id(
                             None,
@@ -555,15 +1033,14 @@ impl Emitter for Operator {
                                 columns: pseudo_columns,
                             }))),
                         );
+                        let sort_metadata = m.sorts.get(id).unwrap();
 
-                        let pseudo_content_reg = program.alloc_register();
                         program.emit_insn(Insn::OpenPseudo {
                             cursor_id: pseudo_cursor,
-                            content_reg: pseudo_content_reg,
-                            num_fields: key.len() + source.column_count(referenced_tables),
+                            content_reg: sort_metadata.sorter_data_register,
+                            num_fields,
                         });
 
-                        let sort_metadata = m.sorts.get(id).unwrap();
                         program.emit_insn_with_label_dependency(
                             Insn::SorterSort {
                                 cursor_id: sort_metadata.sort_cursor,
@@ -578,7 +1055,7 @@ impl Emitter for Operator {
                         );
                         program.emit_insn(Insn::SorterData {
                             cursor_id: sort_metadata.sort_cursor,
-                            dest_reg: pseudo_content_reg,
+                            dest_reg: sort_metadata.sorter_data_register,
                             pseudo_cursor,
                         });
 
@@ -637,7 +1114,7 @@ impl Emitter for Operator {
         program: &mut ProgramBuilder,
         referenced_tables: &[(Rc<BTreeTable>, String)],
         m: &mut Metadata,
-        cursor_override: Option<usize>,
+        cursor_override: Option<&SortCursorOverride>,
     ) -> Result<usize> {
         let col_count = self.column_count(referenced_tables);
         match self {
@@ -647,13 +1124,14 @@ impl Emitter for Operator {
                 ..
             } => {
                 let start_reg = program.alloc_registers(col_count);
-                translate_table_columns(
-                    program,
-                    table,
-                    table_identifier,
-                    cursor_override,
-                    start_reg,
-                );
+                let table = cursor_override
+                    .map(|c| c.pseudo_table.clone())
+                    .unwrap_or_else(|| Table::BTree(table.clone()));
+                let cursor_id = cursor_override
+                    .map(|c| c.cursor_id)
+                    .unwrap_or_else(|| program.resolve_cursor_id(table_identifier, None));
+                let start_column_offset = cursor_override.map(|c| c.sort_key_len).unwrap_or(0);
+                translate_table_columns(program, cursor_id, table, start_column_offset, start_reg);
 
                 Ok(start_reg)
             }
@@ -664,17 +1142,41 @@ impl Emitter for Operator {
 
                 Ok(left_start_reg)
             }
-            Operator::Aggregate { id, aggregates, .. } => {
-                let start_reg = m.aggregation_start_registers.get(id).unwrap();
+            Operator::Aggregate {
+                id,
+                aggregates,
+                group_by,
+                ..
+            } => {
+                let agg_start_reg = m.aggregation_start_registers.get(id).unwrap();
+                program.resolve_label(*m.termination_labels.last().unwrap(), program.offset());
                 for (i, agg) in aggregates.iter().enumerate() {
-                    let agg_result_reg = *start_reg + i;
+                    let agg_result_reg = *agg_start_reg + i;
                     program.emit_insn(Insn::AggFinal {
                         register: agg_result_reg,
                         func: agg.func.clone(),
                     });
                 }
 
-                Ok(*start_reg)
+                if let Some(group_by) = group_by {
+                    let output_row_start_reg =
+                        program.alloc_registers(aggregates.len() + group_by.len());
+                    let group_by_metadata = m.group_bys.get(id).unwrap();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: group_by_metadata.group_exprs_temp_register,
+                        dst_reg: output_row_start_reg,
+                        amount: group_by.len() - 1,
+                    });
+                    program.emit_insn(Insn::Copy {
+                        src_reg: *agg_start_reg,
+                        dst_reg: output_row_start_reg + group_by.len(),
+                        amount: aggregates.len() - 1,
+                    });
+
+                    Ok(output_row_start_reg)
+                } else {
+                    Ok(*agg_start_reg)
+                }
             }
             Operator::Filter { .. } => unreachable!("predicates have been pushed down"),
             Operator::SeekRowid {
@@ -683,13 +1185,14 @@ impl Emitter for Operator {
                 ..
             } => {
                 let start_reg = program.alloc_registers(col_count);
-                translate_table_columns(
-                    program,
-                    table,
-                    table_identifier,
-                    cursor_override,
-                    start_reg,
-                );
+                let table = cursor_override
+                    .map(|c| c.pseudo_table.clone())
+                    .unwrap_or_else(|| Table::BTree(table.clone()));
+                let cursor_id = cursor_override
+                    .map(|c| c.cursor_id)
+                    .unwrap_or_else(|| program.resolve_cursor_id(table_identifier, None));
+                let start_column_offset = cursor_override.map(|c| c.sort_key_len).unwrap_or(0);
+                translate_table_columns(program, cursor_id, table, start_column_offset, start_reg);
 
                 Ok(start_reg)
             }
@@ -700,7 +1203,13 @@ impl Emitter for Operator {
                 id, source, key, ..
             } => {
                 let sort_metadata = m.sorts.get(id).unwrap();
-                let cursor_override = Some(sort_metadata.sort_cursor);
+                let cursor_override = Some(SortCursorOverride {
+                    cursor_id: sort_metadata.pseudo_table_cursor,
+                    pseudo_table: program
+                        .resolve_cursor_to_table(sort_metadata.pseudo_table_cursor)
+                        .unwrap(),
+                    sort_key_len: key.len(),
+                });
                 let sort_keys_count = key.len();
                 let start_reg = program.alloc_registers(sort_keys_count);
                 for (i, (expr, _)) in key.iter().enumerate() {
@@ -710,10 +1219,10 @@ impl Emitter for Operator {
                         Some(referenced_tables),
                         expr,
                         key_reg,
-                        cursor_override,
+                        cursor_override.as_ref().map(|c| c.cursor_id),
                     )?;
                 }
-                source.result_columns(program, referenced_tables, m, cursor_override)?;
+                source.result_columns(program, referenced_tables, m, cursor_override.as_ref())?;
 
                 Ok(start_reg)
             }
@@ -732,17 +1241,26 @@ impl Emitter for Operator {
                                 Some(referenced_tables),
                                 expr,
                                 cur_reg,
-                                cursor_override,
+                                cursor_override.map(|c| c.cursor_id),
                             )?;
                             cur_reg += 1;
                         }
                         ProjectionColumn::Star => {
                             for (table, table_identifier) in referenced_tables.iter() {
+                                let table = cursor_override
+                                    .map(|c| c.pseudo_table.clone())
+                                    .unwrap_or_else(|| Table::BTree(table.clone()));
+                                let cursor_id =
+                                    cursor_override.map(|c| c.cursor_id).unwrap_or_else(|| {
+                                        program.resolve_cursor_id(table_identifier, None)
+                                    });
+                                let start_column_offset =
+                                    cursor_override.map(|c| c.sort_key_len).unwrap_or(0);
                                 cur_reg = translate_table_columns(
                                     program,
+                                    cursor_id,
                                     table,
-                                    table_identifier,
-                                    cursor_override,
+                                    start_column_offset,
                                     cur_reg,
                                 );
                             }
@@ -752,11 +1270,21 @@ impl Emitter for Operator {
                                 .iter()
                                 .find(|(_, id)| id == table_identifier)
                                 .unwrap();
+
+                            let table = cursor_override
+                                .map(|c| c.pseudo_table.clone())
+                                .unwrap_or_else(|| Table::BTree(table.clone()));
+                            let cursor_id =
+                                cursor_override.map(|c| c.cursor_id).unwrap_or_else(|| {
+                                    program.resolve_cursor_id(table_identifier, None)
+                                });
+                            let start_column_offset =
+                                cursor_override.map(|c| c.sort_key_len).unwrap_or(0);
                             cur_reg = translate_table_columns(
                                 program,
+                                cursor_id,
                                 table,
-                                table_identifier,
-                                cursor_override,
+                                start_column_offset,
                                 cur_reg,
                             );
                         }
@@ -773,18 +1301,28 @@ impl Emitter for Operator {
         program: &mut ProgramBuilder,
         referenced_tables: &[(Rc<BTreeTable>, String)],
         m: &mut Metadata,
-        cursor_override: Option<usize>,
+        cursor_override: Option<&SortCursorOverride>,
     ) -> Result<()> {
         match self {
-            Operator::Order { id, source, .. } => {
-                let sort_metadata = m.sorts.get(id).unwrap();
-                source.result_row(
+            Operator::Order {
+                id, source, key, ..
+            } => {
+                let cursor_id = m.sorts.get(id).unwrap().pseudo_table_cursor;
+                let pseudo_table = program.resolve_cursor_to_table(cursor_id).unwrap();
+                let start_column_offset = key.len();
+                let column_count = pseudo_table.columns().len() - start_column_offset;
+                let start_reg = program.alloc_registers(column_count);
+                translate_table_columns(
                     program,
-                    referenced_tables,
-                    m,
-                    Some(sort_metadata.pseudo_table_cursor),
-                )?;
-
+                    cursor_id,
+                    pseudo_table,
+                    start_column_offset,
+                    start_reg,
+                );
+                program.emit_insn(Insn::ResultRow {
+                    start_reg,
+                    count: column_count,
+                });
                 Ok(())
             }
             Operator::Limit { source, limit, .. } => {
@@ -795,7 +1333,7 @@ impl Emitter for Operator {
                     dest: limit_reg,
                 });
                 program.mark_last_insn_constant();
-                let jump_label = m.termination_labels.last().unwrap();
+                let jump_label = m.termination_labels.first().unwrap();
                 program.emit_insn_with_label_dependency(
                     Insn::DecrJumpZero {
                         reg: limit_reg,

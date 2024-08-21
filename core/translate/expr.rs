@@ -3,7 +3,7 @@ use sqlite3_parser::ast::{self, UnaryOperator};
 use std::rc::Rc;
 
 use crate::function::{AggFunc, Func, ScalarFunc};
-use crate::schema::Type;
+use crate::schema::{Table, Type};
 use crate::util::normalize_ident;
 use crate::{
     schema::BTreeTable,
@@ -1182,6 +1182,7 @@ pub fn translate_expr(
             ast::Literal::Null => {
                 program.emit_insn(Insn::Null {
                     dest: target_register,
+                    dest_end: None,
                 });
                 Ok(target_register)
             }
@@ -1363,16 +1364,15 @@ pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mu
 
 pub fn translate_table_columns(
     program: &mut ProgramBuilder,
-    table: &Rc<BTreeTable>,
-    table_identifier: &str,
-    cursor_override: Option<usize>,
+    cursor_id: usize,
+    table: Table,
+    start_column_offset: usize,
     start_reg: usize,
 ) -> usize {
     let mut cur_reg = start_reg;
-    let cursor_id = cursor_override.unwrap_or(program.resolve_cursor_id(table_identifier, None));
-    for i in 0..table.columns.len() {
-        let is_rowid = table.column_is_rowid_alias(&table.columns[i]);
-        let col_type = &table.columns[i].ty;
+    for i in start_column_offset..table.columns().len() {
+        let is_rowid = table.column_is_rowid_alias(&table.get_column_at(i));
+        let col_type = &table.get_column_at(i).ty;
         if is_rowid {
             program.emit_insn(Insn::RowId {
                 cursor_id,

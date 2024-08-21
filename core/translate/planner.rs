@@ -29,6 +29,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
             columns,
             from,
             where_clause,
+            group_by,
             ..
         } => {
             let col_count = columns.len();
@@ -142,19 +143,35 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                         },
                     }
                 }
-
-                let mixing_aggregate_and_non_aggregate_columns =
-                    !aggregate_expressions.is_empty() && aggregate_expressions.len() != col_count;
-
-                if mixing_aggregate_and_non_aggregate_columns {
-                    crate::bail_parse_error!(
-                        "mixing aggregate and non-aggregate columns is not allowed (GROUP BY is not supported)"
-                    );
+                if let Some(group_by) = group_by.as_ref() {
+                    if aggregate_expressions.is_empty() {
+                        crate::bail_parse_error!(
+                            "GROUP BY clause without aggregate functions is not allowed"
+                        );
+                    }
+                    for scalar in scalar_expressions.iter() {
+                        match scalar {
+                            ProjectionColumn::Column(expr) => {
+                                if group_by.exprs.iter().find(|e| *e == expr).is_none() {
+                                    crate::bail_parse_error!(
+                                        "{} must appear in the GROUP BY clause or be used in an aggregate function",
+                                        expr
+                                    );
+                                }
+                            }
+                            _ => {
+                                crate::bail_parse_error!(
+                                    "Only column references are allowed in the SELECT clause when using GROUP BY"
+                                );
+                            }
+                        }
+                    }
                 }
                 if !aggregate_expressions.is_empty() {
                     operator = Operator::Aggregate {
                         source: Box::new(operator),
                         aggregates: aggregate_expressions,
+                        group_by: group_by.map(|g| g.exprs), // TODO: support HAVING
                         id: operator_id_counter.get_next_id(),
                         step: 0,
                     }

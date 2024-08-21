@@ -1,0 +1,43 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+do_execsql_test group_by {
+  select u.first_name, sum(u.age) from users u group by u.first_name limit 10;
+} {Aaron|2271
+Abigail|890
+Adam|1642
+Adrian|439
+Adriana|83
+Adrienne|318
+Aimee|33
+Alan|551
+Albert|369
+Alec|247}
+
+do_execsql_test group_by_two_joined_columns {
+  select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name limit 10;
+} {Aimee|jeans|24
+Cindy|cap|37
+Daniel|coat|13
+Edward|sweatshirt|15
+Jamie|hat|94
+Jennifer|sweater|33
+Matthew|boots|77
+Nicholas|shorts|89
+Rachel|sneakers|63
+Tommy|shirt|18}}
+
+do_execsql_test group_by_order_by {
+  select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by p.name limit 10;
+} {Travis|accessories|22
+Matthew|boots|77
+Cindy|cap|37
+Daniel|coat|13
+Jamie|hat|94
+Aimee|jeans|24
+Tommy|shirt|18
+Nicholas|shorts|89
+Rachel|sneakers|63
+Jennifer|sweater|33}
