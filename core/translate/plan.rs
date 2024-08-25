@@ -1,7 +1,5 @@
 use core::fmt;
 use std::{
-    cell::RefCell,
-    collections::HashMap,
     fmt::{Display, Formatter},
     rc::Rc,
 };

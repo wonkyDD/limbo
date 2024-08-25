@@ -1,6 +1,5 @@
-use std::{collections::HashMap, hash::Hash, rc::Rc};
+use std::{collections::HashMap, rc::Rc};
 
-use libc::group;
 use sqlite3_parser::ast;
 
 use crate::{schema::BTreeTable, util::normalize_ident, Result};
