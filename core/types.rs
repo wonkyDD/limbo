@@ -117,9 +117,6 @@ impl std::cmp::Eq for OwnedValue {}
 
 impl std::cmp::Ord for OwnedValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        if self.partial_cmp(other).is_none() {
-            println!("self: {:?}, other: {:?}", self, other);
-        }
         self.partial_cmp(other).unwrap()
     }
 }
