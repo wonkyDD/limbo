@@ -27,7 +27,7 @@ Jennifer|sweater|33
 Matthew|boots|77
 Nicholas|shorts|89
 Rachel|sneakers|63
-Tommy|shirt|18}}
+Tommy|shirt|18}
 
 do_execsql_test group_by_order_by {
   select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by p.name limit 10;
@@ -41,3 +41,29 @@ Tommy|shirt|18
 Nicholas|shorts|89
 Rachel|sneakers|63
 Jennifer|sweater|33}
+
+do_execsql_test group_by_order_by_aggregate {
+  select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by sum(u.age) limit 10;
+} {Daniel|coat|13
+Edward|sweatshirt|15
+Tommy|shirt|18
+Travis|accessories|22
+Aimee|jeans|24
+Jennifer|sweater|33
+Cindy|cap|37
+Rachel|sneakers|63
+Matthew|boots|77
+Nicholas|shorts|89}
+
+do_execsql_test group_by_multiple_aggregates {
+  select u.first_name, sum(u.age), count(u.age) from users u group by u.first_name order by sum(u.age) limit 10;
+} {Jaclyn|1|1
+Mia|1|1
+Kirsten|7|1
+Kellie|8|1
+Makayla|8|1
+Yvette|9|1
+Mckenzie|12|1
+Grant|14|1
+Mackenzie|15|1
+Cesar|17|1}
