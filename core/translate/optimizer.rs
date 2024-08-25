@@ -13,6 +13,7 @@ use super::plan::{
  * Make a few passes over the plan to optimize it.
  */
 pub fn optimize_plan(mut select_plan: Plan) -> Result<(Plan, ExpressionResultCache)> {
+    let mut expr_result_cache = ExpressionResultCache::new();
     push_predicates(
         &mut select_plan.root_operator,
         &select_plan.referenced_tables,
@@ -20,18 +21,20 @@ pub fn optimize_plan(mut select_plan: Plan) -> Result<(Plan, ExpressionResultCac
     if eliminate_constants(&mut select_plan.root_operator)?
         == ConstantConditionEliminationResult::ImpossibleCondition
     {
-        return Ok(Plan {
-            root_operator: Operator::Nothing,
-            referenced_tables: vec![],
-        });
+        return Ok((
+            Plan {
+                root_operator: Operator::Nothing,
+                referenced_tables: vec![],
+            },
+            expr_result_cache,
+        ));
     }
     use_indexes(
         &mut select_plan.root_operator,
         &select_plan.referenced_tables,
     )?;
-    let mut cem = ExpressionResultCache::new();
-    eliminate_common_expressions(&select_plan.root_operator, &mut cem);
-    Ok((select_plan, cem))
+    eliminate_common_expressions(&select_plan.root_operator, &mut expr_result_cache);
+    Ok((select_plan, expr_result_cache))
 }
 
 /**
@@ -635,7 +638,10 @@ fn find_common_expression(expr: &ast::Expr, operator: &Operator) -> Option<usize
     }
 }
 
-fn eliminate_common_expressions(operator: &Operator, cem: &mut ExpressionResultCache) {
+fn eliminate_common_expressions(
+    operator: &Operator,
+    expr_result_cache: &mut ExpressionResultCache,
+) {
     match operator {
         Operator::Aggregate {
             id,
@@ -649,7 +655,12 @@ fn eliminate_common_expressions(operator: &Operator, cem: &mut ExpressionResultC
                 let result = find_common_expression(&agg.original_expr, source);
                 if result.is_some() {
                     let result = result.unwrap();
-                    cem.set_precomputation_key(operator.id(), idx, source.id(), result);
+                    expr_result_cache.set_precomputation_key(
+                        operator.id(),
+                        idx,
+                        source.id(),
+                        result,
+                    );
                 }
                 idx += 1;
             }
@@ -659,7 +670,12 @@ fn eliminate_common_expressions(operator: &Operator, cem: &mut ExpressionResultC
                     let result = find_common_expression(&g, source);
                     if result.is_some() {
                         let result = result.unwrap();
-                        cem.set_precomputation_key(operator.id(), idx, source.id(), result);
+                        expr_result_cache.set_precomputation_key(
+                            operator.id(),
+                            idx,
+                            source.id(),
+                            result,
+                        );
                     }
                 }
             }
@@ -678,7 +694,7 @@ fn eliminate_common_expressions(operator: &Operator, cem: &mut ExpressionResultC
             source,
             limit,
             step,
-        } => eliminate_common_expressions(source, cem),
+        } => eliminate_common_expressions(source, expr_result_cache),
         Operator::Join {
             id,
             left,
@@ -699,7 +715,12 @@ fn eliminate_common_expressions(operator: &Operator, cem: &mut ExpressionResultC
                 let result = find_common_expression(&expr, source);
                 if result.is_some() {
                     let result = result.unwrap();
-                    cem.set_precomputation_key(operator.id(), idx, source.id(), result);
+                    expr_result_cache.set_precomputation_key(
+                        operator.id(),
+                        idx,
+                        source.id(),
+                        result,
+                    );
                 }
                 idx += 1;
             }
