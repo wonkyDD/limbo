@@ -1,6 +1,9 @@
 use core::fmt;
 use std::{
-    cell::RefCell, collections::HashMap, fmt::{Display, Formatter}, rc::Rc
+    cell::RefCell,
+    collections::HashMap,
+    fmt::{Display, Formatter},
+    rc::Rc,
 };
 
 use sqlite3_parser::ast;
@@ -241,75 +244,6 @@ impl Operator {
             Operator::Scan { id, .. } => *id,
             Operator::Nothing => unreachable!(),
         }
-    }
-
-    pub fn iter_exprs(&self) -> OperatorExprIterator {
-        OperatorExprIterator::new(self)
-    }
-}
-
-pub struct ComputedExprRegistry {
-    id_to_reg_map: Rc<RefCell<HashMap<usize, usize>>>,
-    curr_id: usize
-}
-
-impl ComputedExprRegistry {
-    fn new() -> Self {
-        ComputedExprRegistry {
-            id_to_reg_map: Rc::new(RefCell::new(HashMap::new())),
-            curr_id: 0
-        }
-    }
-
-    fn next_id(&mut self) -> usize {
-        let id = self.curr_id;
-        self.curr_id += 1;
-        id
-    }
-}
-
-pub struct OperatorExprIterator<'a> {
-    inner: Box<dyn Iterator<Item = &'a ast::Expr> + 'a>,
-}
-
-impl<'a> OperatorExprIterator<'a> {
-    fn new(operator: &'a Operator) -> Self {
-        let iter: Box<dyn Iterator<Item = &'a ast::Expr> + 'a> = match operator {
-            Operator::Aggregate { aggregates, group_by, .. } => {
-                let agg_iter = aggregates.iter().map(|agg| &agg.original_expr);
-                let group_iter = group_by.iter().flatten();
-                Box::new(agg_iter.chain(group_iter))
-            },
-            Operator::Filter { .. } => {
-                // empty
-                Box::new(std::iter::empty())
-            }
-            Operator::SeekRowid { rowid_predicate, predicates, .. } => {
-                let rowid_iter = std::iter::once(rowid_predicate);
-                let pred_iter = predicates.iter().flatten();
-                Box::new(rowid_iter.chain(pred_iter))
-            },
-            Operator::Join { predicates, .. } => Box::new(predicates.iter().flatten()),
-            Operator::Order { key, .. } => Box::new(key.iter().map(|(expr, _)| expr)),
-            Operator::Projection { expressions, .. } => Box::new(expressions.iter().filter_map(|e| {
-                if let ProjectionColumn::Column(expr) = e {
-                    Some(expr)
-                } else {
-                    None
-                }
-            })),
-            Operator::Scan { predicates, .. } => Box::new(predicates.iter().flatten()),
-            Operator::Limit { .. } | Operator::Nothing => Box::new(std::iter::empty()),
-        };
-        OperatorExprIterator { inner: iter }
-    }
-}
-
-impl<'a> Iterator for OperatorExprIterator<'a> {
-    type Item = &'a ast::Expr;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
     }
 }
 
