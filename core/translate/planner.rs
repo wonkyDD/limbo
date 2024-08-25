@@ -85,7 +85,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                                 identifier.clone(),
                             ));
                         }
-                        ast::ResultColumn::Expr(expr, _) => match expr {
+                        ast::ResultColumn::Expr(expr, _) => match expr.clone() {
                             ast::Expr::FunctionCall {
                                 name,
                                 distinctness,
@@ -105,6 +105,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                                     Ok(Func::Agg(f)) => aggregate_expressions.push(Aggregate {
                                         func: f,
                                         args: args.unwrap(),
+                                        original_expr: expr,
                                     }),
                                     Ok(_) => {
                                         scalar_expressions.push(ProjectionColumn::Column(
@@ -128,6 +129,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                                     Ok(Func::Agg(f)) => aggregate_expressions.push(Aggregate {
                                         func: f,
                                         args: vec![],
+                                        original_expr: expr,
                                     }),
                                     Ok(Func::Scalar(_)) => {
                                         scalar_expressions.push(ProjectionColumn::Column(
@@ -188,17 +190,18 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
             // Parse the ORDER BY clause
             if let Some(order_by) = select.order_by {
                 let mut key = Vec::new();
+
                 for o in order_by {
                     // if the ORDER BY expression is a number, interpret it as an 1-indexed column number
                     // otherwise, interpret it normally as an expression
-                    let expr = if let ast::Expr::Literal(ast::Literal::Numeric(num)) = o.expr {
+                    let expr = if let ast::Expr::Literal(ast::Literal::Numeric(num)) = &o.expr {
                         let column_number = num.parse::<usize>()?;
                         if column_number == 0 {
                             crate::bail_parse_error!("invalid column index: {}", column_number);
                         }
                         let maybe_result_column = columns.get(column_number - 1);
                         match maybe_result_column {
-                            Some(ResultColumn::Expr(expr, _)) => expr.clone(),
+                            Some(ResultColumn::Expr(e, _)) => e.clone(),
                             None => {
                                 crate::bail_parse_error!("invalid column index: {}", column_number)
                             }
@@ -207,6 +210,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                     } else {
                         o.expr
                     };
+
                     key.push((
                         expr,
                         o.order.map_or(Direction::Ascending, |o| match o {

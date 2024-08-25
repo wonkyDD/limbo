@@ -16,6 +16,7 @@ use super::expr::{
     translate_aggregation, translate_condition_expr, translate_expr, translate_table_columns,
     ConditionMetadata,
 };
+use super::optimizer::ExpressionResultCache;
 use super::plan::Plan;
 use super::plan::{Operator, ProjectionColumn};
 
@@ -101,7 +102,7 @@ pub struct SortCursorOverride {
 #[derive(Debug, Default)]
 pub struct Metadata {
     // labels for the instructions that terminate the execution when a conditional check evaluates to false. typically jumps to Halt, but can also jump to AggFinal if a parent in the tree is an aggregation
-    termination_labels: Vec<BranchOffset>,
+    termination_label_stack: Vec<BranchOffset>,
     // labels for the instructions that jump to the next row in the current operator.
     // for example, in a join with two nested scans, the inner loop will jump to its Next instruction when the join condition is false;
     // in a join with a scan and a seek, the seek will jump to the scan's Next instruction when the join condition is false.
@@ -116,6 +117,7 @@ pub struct Metadata {
     sorts: HashMap<usize, SortMetadata>,
     // mapping between Join operator id and associated metadata (for left joins only)
     left_joins: HashMap<usize, LeftJoinMetadata>,
+    expr_result_cache: ExpressionResultCache,
 }
 
 /**
@@ -183,7 +185,7 @@ impl Emitter for Operator {
                         let cursor_id = program.resolve_cursor_id(table_identifier, None);
                         program.emit_insn(Insn::RewindAsync { cursor_id });
                         let rewind_label = program.allocate_label();
-                        let halt_label = m.termination_labels.last().unwrap();
+                        let halt_label = m.termination_label_stack.last().unwrap();
                         m.rewind_labels.push(rewind_label);
                         program.defer_label_resolution(rewind_label, program.offset() as usize);
                         program.emit_insn_with_label_dependency(
@@ -274,7 +276,7 @@ impl Emitter for Operator {
                         let jump_label = m
                             .next_row_labels
                             .get(id)
-                            .unwrap_or(&m.termination_labels.last().unwrap());
+                            .unwrap_or(&m.termination_label_stack.last().unwrap());
                         program.emit_insn_with_label_dependency(
                             Insn::SeekRowid {
                                 cursor_id,
@@ -343,7 +345,7 @@ impl Emitter for Operator {
                             .next_row_labels
                             .get(&right.id())
                             .or(m.next_row_labels.get(&left.id()))
-                            .unwrap_or(&m.termination_labels.last().unwrap());
+                            .unwrap_or(&m.termination_label_stack.last().unwrap());
 
                         if *outer {
                             let lj_meta = m.left_joins.get(id).unwrap();
@@ -441,6 +443,7 @@ impl Emitter for Operator {
                 aggregates,
                 group_by,
                 step,
+                ..
             } => {
                 *step += 1;
 
@@ -454,7 +457,7 @@ impl Emitter for Operator {
                     match *step {
                         GROUP_BY_INIT => {
                             let agg_final_label = program.allocate_label();
-                            m.termination_labels.push(agg_final_label);
+                            m.termination_label_stack.push(agg_final_label);
                             let num_aggs = aggregates.len();
 
                             let sort_cursor = program.alloc_cursor_id(None, None);
@@ -564,7 +567,7 @@ impl Emitter for Operator {
                                 )?;
                             }
                             for (i, agg) in aggregates.iter().enumerate() {
-                                let expr = &agg.args[0]; // TODO hakhackhachkachkachkachk hack hack
+                                let expr = &agg.args[0]; // TODO hakhackhachkachkachk hack hack
                                 let agg_reg = start_reg + sort_keys_count + i;
                                 translate_expr(
                                     program,
@@ -620,7 +623,7 @@ impl Emitter for Operator {
                                 group_by_metadata.accumulator_indicator_set_true_label;
                             let group_exprs_temp_register =
                                 group_by_metadata.group_exprs_temp_register;
-                            let halt_label = *m.termination_labels.first().unwrap();
+                            let halt_label = *m.termination_label_stack.first().unwrap();
                             let abort_flag_register = group_by_metadata.abort_flag_register;
                             let sorter_key_register = group_by_metadata.sorter_key_register;
 
@@ -735,7 +738,7 @@ impl Emitter for Operator {
                                     target_pc: halt_label,
                                     decrement_by: 0,
                                 },
-                                m.termination_labels[0],
+                                m.termination_label_stack[0],
                             );
 
                             program.emit_insn_with_label_dependency(
@@ -812,11 +815,13 @@ impl Emitter for Operator {
                                 },
                                 group_by_metadata.subroutine_accumulator_output_label,
                             );
+                            let termination_label =
+                                m.termination_label_stack[m.termination_label_stack.len() - 2];
                             program.emit_insn_with_label_dependency(
                                 Insn::Goto {
-                                    target_pc: m.termination_labels[0],
+                                    target_pc: termination_label,
                                 },
-                                m.termination_labels[0],
+                                termination_label,
                             );
                             program.emit_insn(Insn::Integer {
                                 value: 1,
@@ -831,13 +836,14 @@ impl Emitter for Operator {
                                 group_by_metadata.subroutine_accumulator_output_label,
                                 program.offset(),
                             );
+                            let termination_label = *m.termination_label_stack.last().unwrap();
                             program.emit_insn_with_label_dependency(
                                 Insn::IfPos {
                                     reg: group_by_metadata.data_in_accumulator_indicator_register,
-                                    target_pc: m.termination_labels[1],
+                                    target_pc: termination_label,
                                     decrement_by: 0,
                                 },
-                                m.termination_labels[1],
+                                termination_label,
                             );
                             program.emit_insn(Insn::Return {
                                 return_reg: group_by_metadata
@@ -885,7 +891,7 @@ impl Emitter for Operator {
                 match *step {
                     AGGREGATE_INIT => {
                         let agg_final_label = program.allocate_label();
-                        m.termination_labels.push(agg_final_label);
+                        m.termination_label_stack.push(agg_final_label);
                         let num_aggs = aggregates.len();
                         let start_reg = program.alloc_registers(num_aggs);
                         m.aggregation_start_registers.insert(*id, start_reg);
@@ -942,6 +948,7 @@ impl Emitter for Operator {
                 const ORDER_NEXT: usize = 4;
                 match *step {
                     ORDER_INIT => {
+                        m.termination_label_stack.push(program.allocate_label());
                         let sort_cursor = program.alloc_cursor_id(None, None);
                         m.sorts.insert(
                             *id,
@@ -979,11 +986,28 @@ impl Emitter for Operator {
                         let sort_keys_count = key.len();
                         let source_cols_count = source.column_count(referenced_tables);
                         let start_reg = program.alloc_registers(sort_keys_count);
+                        source.result_columns(program, referenced_tables, m, None)?;
+
                         for (i, (expr, _)) in key.iter().enumerate() {
                             let key_reg = start_reg + i;
-                            translate_expr(program, Some(referenced_tables), expr, key_reg, None)?;
+                            if let Some(cached_result_reg) =
+                                m.expr_result_cache.get_precomputed_result_register(*id, i)
+                            {
+                                program.emit_insn(Insn::Copy {
+                                    src_reg: cached_result_reg,
+                                    dst_reg: key_reg,
+                                    amount: 0,
+                                });
+                            } else {
+                                translate_expr(
+                                    program,
+                                    Some(referenced_tables),
+                                    expr,
+                                    key_reg,
+                                    None,
+                                )?;
+                            }
                         }
-                        source.result_columns(program, referenced_tables, m, None)?;
 
                         let sort_metadata = m.sorts.get_mut(id).unwrap();
                         program.emit_insn(Insn::MakeRecord {
@@ -1008,6 +1032,10 @@ impl Emitter for Operator {
                                 _ => unreachable!(),
                             }
                         }
+                        program.resolve_label(
+                            m.termination_label_stack.pop().unwrap(),
+                            program.offset(),
+                        );
                         let column_names = source.column_names();
                         let mut pseudo_columns = vec![];
                         for (i, _) in key.iter().enumerate() {
@@ -1121,6 +1149,7 @@ impl Emitter for Operator {
             Operator::Scan {
                 table,
                 table_identifier,
+                id,
                 ..
             } => {
                 let start_reg = program.alloc_registers(col_count);
@@ -1131,7 +1160,7 @@ impl Emitter for Operator {
                     .map(|c| c.cursor_id)
                     .unwrap_or_else(|| program.resolve_cursor_id(table_identifier, None));
                 let start_column_offset = cursor_override.map(|c| c.sort_key_len).unwrap_or(0);
-                translate_table_columns(program, cursor_id, table, start_column_offset, start_reg);
+                translate_table_columns(program, cursor_id, &table, start_column_offset, start_reg);
 
                 Ok(start_reg)
             }
@@ -1149,13 +1178,20 @@ impl Emitter for Operator {
                 ..
             } => {
                 let agg_start_reg = m.aggregation_start_registers.get(id).unwrap();
-                program.resolve_label(*m.termination_labels.last().unwrap(), program.offset());
+                program.resolve_label(m.termination_label_stack.pop().unwrap(), program.offset());
+                let mut result_column_idx = 0;
                 for (i, agg) in aggregates.iter().enumerate() {
                     let agg_result_reg = *agg_start_reg + i;
                     program.emit_insn(Insn::AggFinal {
                         register: agg_result_reg,
                         func: agg.func.clone(),
                     });
+                    m.expr_result_cache.set_computation_result(
+                        *id,
+                        result_column_idx,
+                        agg_result_reg,
+                    );
+                    result_column_idx += 1;
                 }
 
                 if let Some(group_by) = group_by {
@@ -1167,6 +1203,13 @@ impl Emitter for Operator {
                         dst_reg: output_row_start_reg,
                         amount: group_by.len() - 1,
                     });
+                    for i in 0..group_by.len() {
+                        m.expr_result_cache.set_computation_result(
+                            *id,
+                            result_column_idx + i,
+                            output_row_start_reg + i,
+                        );
+                    }
                     program.emit_insn(Insn::Copy {
                         src_reg: *agg_start_reg,
                         dst_reg: output_row_start_reg + group_by.len(),
@@ -1192,7 +1235,7 @@ impl Emitter for Operator {
                     .map(|c| c.cursor_id)
                     .unwrap_or_else(|| program.resolve_cursor_id(table_identifier, None));
                 let start_column_offset = cursor_override.map(|c| c.sort_key_len).unwrap_or(0);
-                translate_table_columns(program, cursor_id, table, start_column_offset, start_reg);
+                translate_table_columns(program, cursor_id, &table, start_column_offset, start_reg);
 
                 Ok(start_reg)
             }
@@ -1212,17 +1255,28 @@ impl Emitter for Operator {
                 });
                 let sort_keys_count = key.len();
                 let start_reg = program.alloc_registers(sort_keys_count);
-                for (i, (expr, _)) in key.iter().enumerate() {
-                    let key_reg = start_reg + i;
-                    translate_expr(
-                        program,
-                        Some(referenced_tables),
-                        expr,
-                        key_reg,
-                        cursor_override.as_ref().map(|c| c.cursor_id),
-                    )?;
-                }
                 source.result_columns(program, referenced_tables, m, cursor_override.as_ref())?;
+
+                for (i, (expr, _)) in key.iter().enumerate() {
+                    let cur_reg = start_reg + i;
+                    if let Some(cached_result_reg) =
+                        m.expr_result_cache.get_precomputed_result_register(*id, i)
+                    {
+                        program.emit_insn(Insn::Copy {
+                            src_reg: cached_result_reg,
+                            dst_reg: cur_reg,
+                            amount: 0,
+                        });
+                    } else {
+                        translate_expr(
+                            program,
+                            Some(referenced_tables),
+                            expr,
+                            cur_reg,
+                            cursor_override.as_ref().map(|c| c.cursor_id),
+                        )?;
+                    }
+                }
 
                 Ok(start_reg)
             }
@@ -1259,7 +1313,7 @@ impl Emitter for Operator {
                                 cur_reg = translate_table_columns(
                                     program,
                                     cursor_id,
-                                    table,
+                                    &table,
                                     start_column_offset,
                                     cur_reg,
                                 );
@@ -1283,7 +1337,7 @@ impl Emitter for Operator {
                             cur_reg = translate_table_columns(
                                 program,
                                 cursor_id,
-                                table,
+                                &table,
                                 start_column_offset,
                                 cur_reg,
                             );
@@ -1315,7 +1369,7 @@ impl Emitter for Operator {
                 translate_table_columns(
                     program,
                     cursor_id,
-                    pseudo_table,
+                    &pseudo_table,
                     start_column_offset,
                     start_reg,
                 );
@@ -1333,7 +1387,7 @@ impl Emitter for Operator {
                     dest: limit_reg,
                 });
                 program.mark_last_insn_constant();
-                let jump_label = m.termination_labels.first().unwrap();
+                let jump_label = m.termination_label_stack.first().unwrap();
                 program.emit_insn_with_label_dependency(
                     Insn::DecrJumpZero {
                         reg: limit_reg,
@@ -1357,7 +1411,9 @@ impl Emitter for Operator {
     }
 }
 
-fn prologue() -> Result<(
+fn prologue(
+    cache: ExpressionResultCache,
+) -> Result<(
     ProgramBuilder,
     Metadata,
     BranchOffset,
@@ -1378,7 +1434,8 @@ fn prologue() -> Result<(
     let start_offset = program.offset();
 
     let metadata = Metadata {
-        termination_labels: vec![halt_label],
+        termination_label_stack: vec![halt_label],
+        expr_result_cache: cache,
         ..Default::default()
     };
 
@@ -1410,8 +1467,9 @@ fn epilogue(
 pub fn emit_program(
     database_header: Rc<RefCell<DatabaseHeader>>,
     mut plan: Plan,
+    cache: ExpressionResultCache,
 ) -> Result<Program> {
-    let (mut program, mut metadata, init_label, halt_label, start_offset) = prologue()?;
+    let (mut program, mut metadata, init_label, halt_label, start_offset) = prologue(cache)?;
 
     loop {
         match plan

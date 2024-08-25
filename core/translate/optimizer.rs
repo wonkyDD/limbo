@@ -1,5 +1,6 @@
-use std::rc::Rc;
+use std::{collections::HashMap, hash::Hash, rc::Rc};
 
+use libc::group;
 use sqlite3_parser::ast;
 
 use crate::{schema::BTreeTable, util::normalize_ident, Result};
@@ -11,7 +12,7 @@ use super::plan::{
 /**
  * Make a few passes over the plan to optimize it.
  */
-pub fn optimize_plan(mut select_plan: Plan) -> Result<Plan> {
+pub fn optimize_plan(mut select_plan: Plan) -> Result<(Plan, ExpressionResultCache)> {
     push_predicates(
         &mut select_plan.root_operator,
         &select_plan.referenced_tables,
@@ -28,7 +29,9 @@ pub fn optimize_plan(mut select_plan: Plan) -> Result<Plan> {
         &mut select_plan.root_operator,
         &select_plan.referenced_tables,
     )?;
-    Ok(select_plan)
+    let mut cem = ExpressionResultCache::new();
+    eliminate_common_expressions(&select_plan.root_operator, &mut cem);
+    Ok((select_plan, cem))
 }
 
 /**
@@ -523,6 +526,201 @@ fn push_predicate(
     }
 }
 
+#[derive(Debug, Default)]
+pub struct ExpressionResultCache {
+    hashmap: HashMap<usize, usize>,
+}
+
+const DEPENDENCY_OPERATOR_ID_MULTIPLIER: usize = 1000000000000;
+const DEPENDENT_OPERATOR_ID_MULTIPLIER: usize = 1000000;
+
+impl ExpressionResultCache {
+    pub fn new() -> Self {
+        ExpressionResultCache {
+            hashmap: HashMap::new(),
+        }
+    }
+
+    pub fn set_computation_result(
+        &mut self,
+        operator_id: usize,
+        result_column_idx: usize,
+        register_idx: usize,
+    ) {
+        let key = operator_id * DEPENDENCY_OPERATOR_ID_MULTIPLIER + result_column_idx;
+        self.hashmap.insert(key, register_idx);
+    }
+
+    pub fn set_precomputation_key(
+        &mut self,
+        operator_id: usize,
+        result_column_idx: usize,
+        child_operator_id: usize,
+        child_operator_result_column_idx: usize,
+    ) -> () {
+        let key = operator_id * DEPENDENT_OPERATOR_ID_MULTIPLIER + result_column_idx;
+        let value = child_operator_id * DEPENDENCY_OPERATOR_ID_MULTIPLIER
+            + child_operator_result_column_idx;
+        self.hashmap.insert(key, value);
+    }
+
+    pub fn get_precomputed_result_register(
+        &self,
+        operator_id: usize,
+        result_column_idx: usize,
+    ) -> Option<usize> {
+        let key = operator_id * DEPENDENT_OPERATOR_ID_MULTIPLIER + result_column_idx;
+        self.hashmap
+            .get(&key)
+            .and_then(|k| self.hashmap.get(k).copied())
+    }
+}
+
+fn find_common_expression(expr: &ast::Expr, operator: &Operator) -> Option<usize> {
+    match operator {
+        Operator::Aggregate {
+            aggregates,
+            group_by,
+            ..
+        } => {
+            let mut idx = 0;
+            for agg in aggregates.iter() {
+                if agg.original_expr == *expr {
+                    return Some(idx);
+                }
+                idx += 1;
+            }
+
+            if let Some(group_by) = group_by {
+                for g in group_by.iter() {
+                    if g == expr {
+                        return Some(idx);
+                    }
+                    idx += 1
+                }
+            }
+
+            None
+        }
+        Operator::Filter { .. } => None,
+        Operator::SeekRowid { .. } => None,
+        Operator::Limit { .. } => None,
+        Operator::Join { .. } => None,
+        Operator::Order { .. } => None,
+        Operator::Projection { expressions, .. } => {
+            let mut idx = 0;
+            for e in expressions.iter() {
+                match e {
+                    super::plan::ProjectionColumn::Column(c) => {
+                        if c == expr {
+                            return Some(idx);
+                        }
+                    }
+                    super::plan::ProjectionColumn::Star => {}
+                    super::plan::ProjectionColumn::TableStar(_, _) => {}
+                }
+                idx += 1;
+            }
+
+            None
+        }
+        Operator::Scan {
+            id,
+            table,
+            table_identifier,
+            predicates,
+            step,
+        } => None,
+        Operator::Nothing => None,
+    }
+}
+
+fn eliminate_common_expressions(operator: &Operator, cem: &mut ExpressionResultCache) {
+    match operator {
+        Operator::Aggregate {
+            id,
+            source,
+            aggregates,
+            group_by,
+            step,
+        } => {
+            let mut idx = 0;
+            for agg in aggregates.iter() {
+                let result = find_common_expression(&agg.original_expr, source);
+                if result.is_some() {
+                    let result = result.unwrap();
+                    cem.set_precomputation_key(operator.id(), idx, source.id(), result);
+                }
+                idx += 1;
+            }
+
+            if let Some(group_by) = group_by {
+                for g in group_by.iter() {
+                    let result = find_common_expression(&g, source);
+                    if result.is_some() {
+                        let result = result.unwrap();
+                        cem.set_precomputation_key(operator.id(), idx, source.id(), result);
+                    }
+                }
+            }
+        }
+        Operator::Filter { .. } => unreachable!(),
+        Operator::SeekRowid {
+            id,
+            table,
+            table_identifier,
+            rowid_predicate,
+            predicates,
+            step,
+        } => {}
+        Operator::Limit {
+            id,
+            source,
+            limit,
+            step,
+        } => eliminate_common_expressions(source, cem),
+        Operator::Join {
+            id,
+            left,
+            right,
+            predicates,
+            outer,
+            step,
+        } => {}
+        Operator::Order {
+            id,
+            source,
+            key,
+            step,
+        } => {
+            let mut idx = 0;
+
+            for (expr, _) in key.iter() {
+                let result = find_common_expression(&expr, source);
+                if result.is_some() {
+                    let result = result.unwrap();
+                    cem.set_precomputation_key(operator.id(), idx, source.id(), result);
+                }
+                idx += 1;
+            }
+        }
+        Operator::Projection {
+            id,
+            source,
+            expressions,
+            step,
+        } => {}
+        Operator::Scan {
+            id,
+            table,
+            table_identifier,
+            predicates,
+            step,
+        } => {}
+        Operator::Nothing => {}
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstantPredicate {
     AlwaysTrue,
@@ -761,8 +959,4 @@ impl TakeOwnership for Operator {
     fn take_ownership(&mut self) -> Self {
         std::mem::replace(self, Operator::Nothing)
     }
-}
-
-fn replace_with<T: TakeOwnership>(expr: &mut T, mut replacement: T) {
-    *expr = replacement.take_ownership();
 }

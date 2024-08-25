@@ -93,6 +93,21 @@ impl std::cmp::PartialOrd<OwnedValue> for OwnedValue {
             (OwnedValue::Null, OwnedValue::Null) => Some(std::cmp::Ordering::Equal),
             (OwnedValue::Null, _) => Some(std::cmp::Ordering::Less),
             (_, OwnedValue::Null) => Some(std::cmp::Ordering::Greater),
+            (OwnedValue::Agg(a), OwnedValue::Agg(b)) => a.partial_cmp(b),
+            _ => None,
+        }
+    }
+}
+
+impl std::cmp::PartialOrd<AggContext> for AggContext {
+    fn partial_cmp(&self, other: &AggContext) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (AggContext::Avg(a, _), AggContext::Avg(b, _)) => a.partial_cmp(b),
+            (AggContext::Sum(a), AggContext::Sum(b)) => a.partial_cmp(b),
+            (AggContext::Count(a), AggContext::Count(b)) => a.partial_cmp(b),
+            (AggContext::Max(a), AggContext::Max(b)) => a.partial_cmp(b),
+            (AggContext::Min(a), AggContext::Min(b)) => a.partial_cmp(b),
+            (AggContext::GroupConcat(a), AggContext::GroupConcat(b)) => a.partial_cmp(b),
             _ => None,
         }
     }
@@ -102,6 +117,9 @@ impl std::cmp::Eq for OwnedValue {}
 
 impl std::cmp::Ord for OwnedValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.partial_cmp(other).is_none() {
+            println!("self: {:?}, other: {:?}", self, other);
+        }
         self.partial_cmp(other).unwrap()
     }
 }

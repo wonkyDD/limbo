@@ -1365,7 +1365,7 @@ pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mu
 pub fn translate_table_columns(
     program: &mut ProgramBuilder,
     cursor_id: usize,
-    table: Table,
+    table: &Table,
     start_column_offset: usize,
     start_reg: usize,
 ) -> usize {
