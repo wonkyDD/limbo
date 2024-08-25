@@ -533,8 +533,8 @@ pub struct ExpressionResultCache {
     hashmap: HashMap<usize, usize>,
 }
 
-const DEPENDENCY_OPERATOR_ID_MULTIPLIER: usize = 1000000000000;
-const DEPENDENT_OPERATOR_ID_MULTIPLIER: usize = 1000000;
+const DEPENDENCY_OPERATOR_ID_MULTIPLIER: usize = 100000000;
+const DEPENDENT_OPERATOR_ID_MULTIPLIER: usize = 10000;
 
 impl ExpressionResultCache {
     pub fn new() -> Self {
