@@ -77,19 +77,34 @@ pub struct SortMetadata {
 
 #[derive(Debug)]
 pub struct GroupByMetadata {
+    // Cursor ID for the Sorter table where the grouped rows are stored
     pub sort_cursor: usize,
+    // Label for the subroutine that clears the accumulator registers (temporary storage for per-group aggregate calculations)
     pub subroutine_accumulator_clear_label: BranchOffset,
+    // Register holding the return offset for the accumulator clear subroutine
     pub subroutine_accumulator_clear_return_offset_register: usize,
+    // Label for the subroutine that outputs the accumulator contents
     pub subroutine_accumulator_output_label: BranchOffset,
+    // Register holding the return offset for the accumulator output subroutine
     pub subroutine_accumulator_output_return_offset_register: usize,
+    // Label for the instruction that sets the accumulator indicator to true (indicating data exists in the accumulator for the current group)
     pub accumulator_indicator_set_true_label: BranchOffset,
+    // Label for the instruction where SorterData is emitted (used for fetching sorted data)
     pub sorter_data_label: BranchOffset,
+    // Register holding the key used for sorting in the Sorter
     pub sorter_key_register: usize,
-    pub done_label: BranchOffset,
+    // Label for the instruction signaling the completion of grouping operations
+    pub grouping_done_label: BranchOffset,
+    // Register holding a flag to abort the grouping process if necessary
     pub abort_flag_register: usize,
+    // Register holding a boolean indicating whether there's data in the accumulator (used for aggregation)
     pub data_in_accumulator_indicator_register: usize,
-    pub group_exprs_temp_register: usize,
-    pub comparison_register: usize,
+    // Register holding the start of the accumulator group registers (i.e. the groups, not the aggregates)
+    pub group_exprs_accumulator_register: usize,
+    // Starting index of the register(s) that hold the comparison result between the current row and the previous row
+    // The comparison result is used to determine if the current row belongs to the same group as the previous row
+    // Each group by expression has a corresponding register
+    pub group_exprs_comparison_register: usize,
 }
 
 #[derive(Debug)]
@@ -464,8 +479,10 @@ impl Emitter for Operator {
 
                             let abort_flag_register = program.alloc_register();
                             let data_in_accumulator_indicator_register = program.alloc_register();
-                            let comparison_start_reg = program.alloc_registers(group_by.len());
-                            let group_exprs_temp_register = program.alloc_registers(group_by.len());
+                            let group_exprs_comparison_register =
+                                program.alloc_registers(group_by.len());
+                            let group_exprs_accumulator_register =
+                                program.alloc_registers(group_by.len());
                             let agg_exprs_start_reg = program.alloc_registers(num_aggs);
                             m.aggregation_start_registers
                                 .insert(*id, agg_exprs_start_reg);
@@ -474,7 +491,7 @@ impl Emitter for Operator {
                             let subroutine_accumulator_clear_label = program.allocate_label();
                             let subroutine_accumulator_output_label = program.allocate_label();
                             let sorter_data_label = program.allocate_label();
-                            let done_label = program.allocate_label();
+                            let grouping_done_label = program.allocate_label();
 
                             let mut order = Vec::new();
                             const ASCENDING: i64 = 0;
@@ -498,9 +515,9 @@ impl Emitter for Operator {
                                 "initialize group by comparison registers to NULL",
                             );
                             program.emit_insn(Insn::Null {
-                                dest: comparison_start_reg,
+                                dest: group_exprs_comparison_register,
                                 dest_end: if group_by.len() > 1 {
-                                    Some(comparison_start_reg + group_by.len() - 1)
+                                    Some(group_exprs_comparison_register + group_by.len() - 1)
                                 } else {
                                     None
                                 },
@@ -532,11 +549,11 @@ impl Emitter for Operator {
                                         .alloc_register(),
                                     accumulator_indicator_set_true_label: program.allocate_label(),
                                     sorter_data_label,
-                                    done_label,
+                                    grouping_done_label,
                                     abort_flag_register,
                                     data_in_accumulator_indicator_register,
-                                    group_exprs_temp_register,
-                                    comparison_register: comparison_start_reg,
+                                    group_exprs_accumulator_register,
+                                    group_exprs_comparison_register,
                                     sorter_key_register,
                                 },
                             );
@@ -606,7 +623,8 @@ impl Emitter for Operator {
 
                             let group_by_metadata = m.group_bys.get_mut(id).unwrap();
 
-                            let comparison_register = group_by_metadata.comparison_register;
+                            let comparison_register =
+                                group_by_metadata.group_exprs_comparison_register;
                             let subroutine_accumulator_output_return_offset_register =
                                 group_by_metadata
                                     .subroutine_accumulator_output_return_offset_register;
@@ -621,8 +639,8 @@ impl Emitter for Operator {
                                 group_by_metadata.data_in_accumulator_indicator_register;
                             let accumulator_indicator_set_true_label =
                                 group_by_metadata.accumulator_indicator_set_true_label;
-                            let group_exprs_temp_register =
-                                group_by_metadata.group_exprs_temp_register;
+                            let group_exprs_start_register =
+                                group_by_metadata.group_exprs_accumulator_register;
                             let halt_label = *m.termination_label_stack.first().unwrap();
                             let abort_flag_register = group_by_metadata.abort_flag_register;
                             let sorter_key_register = group_by_metadata.sorter_key_register;
@@ -669,9 +687,9 @@ impl Emitter for Operator {
                             program.emit_insn_with_label_dependency(
                                 Insn::SorterSort {
                                     cursor_id: group_by_metadata.sort_cursor,
-                                    pc_if_empty: group_by_metadata.done_label,
+                                    pc_if_empty: group_by_metadata.grouping_done_label,
                                 },
-                                group_by_metadata.done_label,
+                                group_by_metadata.grouping_done_label,
                             );
 
                             program.defer_label_resolution(
@@ -728,10 +746,6 @@ impl Emitter for Operator {
                                 subroutine_accumulator_output_label,
                             );
 
-                            // 22      IfPos          2     45    0                    0   if r[2]>0 then r[2]-=0, goto 45; check abort flag
-                            // 23      Gosub          4     42    0                    0   reset accumulator
-                            //
-
                             program.emit_insn_with_label_dependency(
                                 Insn::IfPos {
                                     reg: abort_flag_register,
@@ -772,7 +786,7 @@ impl Emitter for Operator {
                             );
 
                             for (i, expr) in group_by.iter().enumerate() {
-                                let key_reg = group_exprs_temp_register + i;
+                                let key_reg = group_exprs_start_register + i;
                                 translate_expr(
                                     program,
                                     Some(referenced_tables),
@@ -804,7 +818,10 @@ impl Emitter for Operator {
                                 group_by_metadata.sorter_data_label,
                             );
 
-                            program.resolve_label(group_by_metadata.done_label, program.offset());
+                            program.resolve_label(
+                                group_by_metadata.grouping_done_label,
+                                program.offset(),
+                            );
 
                             program.emit_insn_with_label_dependency(
                                 Insn::Gosub {
@@ -863,7 +880,7 @@ impl Emitter for Operator {
                                 group_by_metadata.subroutine_accumulator_clear_label,
                                 program.offset(),
                             );
-                            let start_reg = group_by_metadata.group_exprs_temp_register;
+                            let start_reg = group_by_metadata.group_exprs_accumulator_register;
                             program.emit_insn(Insn::Null {
                                 dest: start_reg,
                                 dest_end: Some(start_reg + group_by.len() + aggregates.len() - 1),
@@ -1199,7 +1216,7 @@ impl Emitter for Operator {
                         program.alloc_registers(aggregates.len() + group_by.len());
                     let group_by_metadata = m.group_bys.get(id).unwrap();
                     program.emit_insn(Insn::Copy {
-                        src_reg: group_by_metadata.group_exprs_temp_register,
+                        src_reg: group_by_metadata.group_exprs_accumulator_register,
                         dst_reg: output_row_start_reg,
                         amount: group_by.len() - 1,
                     });
