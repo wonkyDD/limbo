@@ -543,9 +543,10 @@ fn push_predicate(
 /// instead the ORDER operator can look up the register index where the result is stored and read the value from there.
 ///
 /// The cache uses a hashmap to store the mapping between expression identifiers and their
-/// computed results. It supports two main operations:
-/// 1. Storing computation results for specific operators and result columns.
-/// 2. Storing and retrieving precomputation keys for dependent operators.
+/// computed results. It has the following operations:
+/// 1. Mark an operator's result as being dependent on another operator's result.
+/// 2. Store the result of an expression computation.
+/// 3. Retrieve the result of an expression computation.
 ///
 /// The expressions are identified by a combination of the operator ID and the result column index.
 /// The dependent operator IDs and dependency operator IDs are multiplied by a large constant to avoid key collisions.
