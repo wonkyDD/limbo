@@ -114,6 +114,9 @@ pub struct SortCursorOverride {
     pub sort_key_len: usize,
 }
 
+/// The Metadata struct holds various information and labels used during bytecode generation.
+/// It is used for maintaining state and control flow during the bytecode
+/// generation process.
 #[derive(Debug, Default)]
 pub struct Metadata {
     // labels for the instructions that terminate the execution when a conditional check evaluates to false. typically jumps to Halt, but can also jump to AggFinal if a parent in the tree is an aggregation
@@ -135,22 +138,18 @@ pub struct Metadata {
     expr_result_cache: ExpressionResultCache,
 }
 
-/**
-*  Emitters return one of three possible results from the step() method:
-*  - Continue: the operator is not yet ready to emit a result row
-*  - ReadyToEmit: the operator is ready to emit a result row
-*  - Done: the operator has completed execution
-*  For example, a Scan operator will return Continue until it has opened a cursor, rewound it and applied any predicates.
-*  At that point, it will return ReadyToEmit.
-*  Finally, when the Scan operator has emitted a Next instruction, it will return Done.
-*
-*  Parent operators are free to make decisions based on the result a child operator's step() method.
-*
-*  When the root operator of a Plan returns ReadyToEmit, a ResultRow will always be emitted.
-*  When the root operator returns Done, the bytecode plan is complete.
-*
-
-*/
+/// Emitters return one of three possible results from the step() method:
+/// - Continue: the operator is not yet ready to emit a result row
+/// - ReadyToEmit: the operator is ready to emit a result row
+/// - Done: the operator has completed execution
+/// For example, a Scan operator will return Continue until it has opened a cursor, rewound it and applied any predicates.
+/// At that point, it will return ReadyToEmit.
+/// Finally, when the Scan operator has emitted a Next instruction, it will return Done.
+///
+/// Parent operators are free to make decisions based on the result a child operator's step() method.
+///
+/// When the root operator of a Plan returns ReadyToEmit, a ResultRow will always be emitted.
+/// When the root operator returns Done, the bytecode plan is complete.
 #[derive(Debug, PartialEq)]
 pub enum OpStepResult {
     Continue,
@@ -1166,7 +1165,6 @@ impl Emitter for Operator {
             Operator::Scan {
                 table,
                 table_identifier,
-                
                 ..
             } => {
                 let start_reg = program.alloc_registers(col_count);
@@ -1259,9 +1257,7 @@ impl Emitter for Operator {
             Operator::Limit { .. } => {
                 unimplemented!()
             }
-            Operator::Order {
-                id,  key, ..
-            } => {
+            Operator::Order { id, key, .. } => {
                 let cursor_id = m.sorts.get(id).unwrap().pseudo_table_cursor;
                 let pseudo_table = program.resolve_cursor_to_table(cursor_id).unwrap();
                 let start_column_offset = key.len();
