@@ -8,6 +8,7 @@ use sqlite3_parser::ast;
 use crate::schema::{BTreeTable, Column, PseudoTable, Table};
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::types::{OwnedRecord, OwnedValue};
+use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::{BranchOffset, Insn, Program};
 use crate::Result;
@@ -649,9 +650,13 @@ impl Emitter for Operator {
                                 // table. This is not very robust IMO and we should refactor how these
                                 // are handled.
                                 column_names.push(match expr {
-                                    ast::Expr::Id(ident) => ident.0.clone(),
+                                    ast::Expr::Id(ident) => normalize_ident(&ident.0),
                                     ast::Expr::Qualified(tbl, ident) => {
-                                        format!("{}.{}", tbl.0, ident.0)
+                                        format!(
+                                            "{}.{}",
+                                            normalize_ident(&tbl.0),
+                                            normalize_ident(&ident.0)
+                                        )
                                     }
                                     _ => "expr".to_string(),
                                 });
