@@ -644,7 +644,10 @@ impl Emitter for Operator {
                                 .chain(aggregates.iter().map(|agg| &agg.args[0]))
                             // FIXME: just blindly taking the first arg is a hack
                             {
-                                // FIXME: need a more robust way to determine column names
+                                // FIXME: reading from pseudo tables made during sort operations
+                                // now relies on them having the same column names as the original
+                                // table. This is not very robust IMO and we should refactor how these
+                                // are handled.
                                 column_names.push(match expr {
                                     ast::Expr::Id(ident) => ident.0.clone(),
                                     ast::Expr::Qualified(tbl, ident) => {
