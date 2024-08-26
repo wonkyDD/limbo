@@ -622,27 +622,20 @@ impl Emitter for Operator {
 
                             let group_by_metadata = m.group_bys.get_mut(id).unwrap();
 
-                            let comparison_register =
-                                group_by_metadata.group_exprs_comparison_register;
-                            let subroutine_accumulator_output_return_offset_register =
-                                group_by_metadata
-                                    .subroutine_accumulator_output_return_offset_register;
-                            let subroutine_accumulator_output_label =
-                                group_by_metadata.subroutine_accumulator_output_label;
-                            let subroutine_accumulator_clear_return_offset_register =
-                                group_by_metadata
-                                    .subroutine_accumulator_clear_return_offset_register;
-                            let subroutine_accumulator_clear_label =
-                                group_by_metadata.subroutine_accumulator_clear_label;
-                            let data_in_accumulator_indicator_register =
-                                group_by_metadata.data_in_accumulator_indicator_register;
-                            let accumulator_indicator_set_true_label =
-                                group_by_metadata.accumulator_indicator_set_true_label;
-                            let group_exprs_start_register =
-                                group_by_metadata.group_exprs_accumulator_register;
+                            let GroupByMetadata {
+                                group_exprs_comparison_register: comparison_register,
+                                subroutine_accumulator_output_return_offset_register,
+                                subroutine_accumulator_output_label,
+                                subroutine_accumulator_clear_return_offset_register,
+                                subroutine_accumulator_clear_label,
+                                data_in_accumulator_indicator_register,
+                                accumulator_indicator_set_true_label,
+                                group_exprs_accumulator_register: group_exprs_start_register,
+                                abort_flag_register,
+                                sorter_key_register,
+                                ..
+                            } = *group_by_metadata;
                             let halt_label = *m.termination_label_stack.first().unwrap();
-                            let abort_flag_register = group_by_metadata.abort_flag_register;
-                            let sorter_key_register = group_by_metadata.sorter_key_register;
 
                             let mut column_names =
                                 Vec::with_capacity(current_operator_column_count);
