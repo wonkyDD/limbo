@@ -14,7 +14,7 @@ pub struct OperatorIdCounter {
 
 impl OperatorIdCounter {
     pub fn new() -> Self {
-        Self { id: 0 }
+        Self { id: 1 }
     }
     pub fn get_next_id(&mut self) -> usize {
         let id = self.id;
