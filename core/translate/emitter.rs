@@ -1166,7 +1166,7 @@ impl Emitter for Operator {
             Operator::Scan {
                 table,
                 table_identifier,
-                id,
+                
                 ..
             } => {
                 let start_reg = program.alloc_registers(col_count);
@@ -1260,40 +1260,20 @@ impl Emitter for Operator {
                 unimplemented!()
             }
             Operator::Order {
-                id, source, key, ..
+                id,  key, ..
             } => {
-                let sort_metadata = m.sorts.get(id).unwrap();
-                let cursor_override = Some(SortCursorOverride {
-                    cursor_id: sort_metadata.pseudo_table_cursor,
-                    pseudo_table: program
-                        .resolve_cursor_to_table(sort_metadata.pseudo_table_cursor)
-                        .unwrap(),
-                    sort_key_len: key.len(),
-                });
-                let sort_keys_count = key.len();
-                let start_reg = program.alloc_registers(sort_keys_count);
-                source.result_columns(program, referenced_tables, m, cursor_override.as_ref())?;
-
-                for (i, (expr, _)) in key.iter().enumerate() {
-                    let cur_reg = start_reg + i;
-                    if let Some(cached_result_reg) =
-                        m.expr_result_cache.get_precomputed_result_register(*id, i)
-                    {
-                        program.emit_insn(Insn::Copy {
-                            src_reg: cached_result_reg,
-                            dst_reg: cur_reg,
-                            amount: 0,
-                        });
-                    } else {
-                        translate_expr(
-                            program,
-                            Some(referenced_tables),
-                            expr,
-                            cur_reg,
-                            cursor_override.as_ref().map(|c| c.cursor_id),
-                        )?;
-                    }
-                }
+                let cursor_id = m.sorts.get(id).unwrap().pseudo_table_cursor;
+                let pseudo_table = program.resolve_cursor_to_table(cursor_id).unwrap();
+                let start_column_offset = key.len();
+                let column_count = pseudo_table.columns().len() - start_column_offset;
+                let start_reg = program.alloc_registers(column_count);
+                translate_table_columns(
+                    program,
+                    cursor_id,
+                    &pseudo_table,
+                    start_column_offset,
+                    start_reg,
+                );
 
                 Ok(start_reg)
             }
@@ -1375,27 +1355,6 @@ impl Emitter for Operator {
         cursor_override: Option<&SortCursorOverride>,
     ) -> Result<()> {
         match self {
-            Operator::Order {
-                id, source, key, ..
-            } => {
-                let cursor_id = m.sorts.get(id).unwrap().pseudo_table_cursor;
-                let pseudo_table = program.resolve_cursor_to_table(cursor_id).unwrap();
-                let start_column_offset = key.len();
-                let column_count = pseudo_table.columns().len() - start_column_offset;
-                let start_reg = program.alloc_registers(column_count);
-                translate_table_columns(
-                    program,
-                    cursor_id,
-                    &pseudo_table,
-                    start_column_offset,
-                    start_reg,
-                );
-                program.emit_insn(Insn::ResultRow {
-                    start_reg,
-                    count: column_count,
-                });
-                Ok(())
-            }
             Operator::Limit { source, limit, .. } => {
                 source.result_row(program, referenced_tables, m, cursor_override)?;
                 let limit_reg = program.alloc_register();
