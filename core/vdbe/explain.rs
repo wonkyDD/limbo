@@ -87,10 +87,7 @@ pub fn insn_to_str(
                 *target_pc_gt as i32,
                 OwnedValue::Text(Rc::new("".to_string())),
                 0,
-                format!(
-                    "goto {} if <, goto {} if ==, goto {} if >",
-                    target_pc_lt, target_pc_eq, target_pc_gt
-                ),
+                "".to_string(),
             ),
             Insn::Move {
                 source_reg,

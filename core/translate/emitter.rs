@@ -722,6 +722,10 @@ impl Emitter for Operator {
 
                             let agg_step_label = program.allocate_label();
 
+                            program.add_comment(
+                                program.offset(),
+                                "start new group if comparison is not equal",
+                            );
                             program.emit_insn_with_label_dependency(
                                 Insn::Jump {
                                     target_pc_lt: program.offset() + 1,
@@ -737,6 +741,10 @@ impl Emitter for Operator {
                                 count: group_by.len(),
                             });
 
+                            program.add_comment(
+                                program.offset(),
+                                "check if ended group had data, and output if so",
+                            );
                             program.emit_insn_with_label_dependency(
                                 Insn::Gosub {
                                     target_pc: subroutine_accumulator_output_label,
@@ -746,6 +754,7 @@ impl Emitter for Operator {
                                 subroutine_accumulator_output_label,
                             );
 
+                            program.add_comment(program.offset(), "check abort flag");
                             program.emit_insn_with_label_dependency(
                                 Insn::IfPos {
                                     reg: abort_flag_register,
@@ -755,6 +764,8 @@ impl Emitter for Operator {
                                 m.termination_label_stack[0],
                             );
 
+                            program
+                                .add_comment(program.offset(), "goto clear accumulator subroutine");
                             program.emit_insn_with_label_dependency(
                                 Insn::Gosub {
                                     target_pc: subroutine_accumulator_clear_label,
@@ -776,6 +787,10 @@ impl Emitter for Operator {
                                 )?;
                             }
 
+                            program.add_comment(
+                                program.offset(),
+                                "don't emit group columns if continuing existing group",
+                            );
                             program.emit_insn_with_label_dependency(
                                 Insn::If {
                                     target_pc: accumulator_indicator_set_true_label,
@@ -823,6 +838,7 @@ impl Emitter for Operator {
                                 program.offset(),
                             );
 
+                            program.add_comment(program.offset(), "emit row for final group");
                             program.emit_insn_with_label_dependency(
                                 Insn::Gosub {
                                     target_pc: group_by_metadata
@@ -832,6 +848,8 @@ impl Emitter for Operator {
                                 },
                                 group_by_metadata.subroutine_accumulator_output_label,
                             );
+
+                            program.add_comment(program.offset(), "group by finished");
                             let termination_label =
                                 m.termination_label_stack[m.termination_label_stack.len() - 2];
                             program.emit_insn_with_label_dependency(
@@ -852,6 +870,11 @@ impl Emitter for Operator {
                             program.resolve_label(
                                 group_by_metadata.subroutine_accumulator_output_label,
                                 program.offset(),
+                            );
+
+                            program.add_comment(
+                                program.offset(),
+                                "output group by row subroutine start",
                             );
                             let termination_label = *m.termination_label_stack.last().unwrap();
                             program.emit_insn_with_label_dependency(
@@ -876,6 +899,10 @@ impl Emitter for Operator {
                                     .subroutine_accumulator_output_return_offset_register,
                             });
 
+                            program.add_comment(
+                                program.offset(),
+                                "clear accumulator subroutine start",
+                            );
                             program.resolve_label(
                                 group_by_metadata.subroutine_accumulator_clear_label,
                                 program.offset(),
