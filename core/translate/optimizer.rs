@@ -679,13 +679,7 @@ fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> Option<us
 
             None
         }
-        Operator::Scan {
-            id,
-            table,
-            table_identifier,
-            predicates,
-            step,
-        } => None,
+        Operator::Scan { .. } => None,
         Operator::Nothing => None,
     }
 }
@@ -713,17 +707,15 @@ fn mark_shared_expressions_for_caching(
 ) {
     match operator {
         Operator::Aggregate {
-            id,
             source,
             aggregates,
             group_by,
-            step,
+            ..
         } => {
             let mut idx = 0;
             for agg in aggregates.iter() {
                 let result = find_identical_expression(&agg.original_expr, source);
-                if result.is_some() {
-                    let result = result.unwrap();
+                if let Some(result) = result {
                     expr_result_cache.set_precomputation_key(
                         operator.id(),
                         idx,
@@ -737,8 +729,7 @@ fn mark_shared_expressions_for_caching(
             if let Some(group_by) = group_by {
                 for g in group_by.iter() {
                     let result = find_identical_expression(&g, source);
-                    if result.is_some() {
-                        let result = result.unwrap();
+                    if let Some(result) = result {
                         expr_result_cache.set_precomputation_key(
                             operator.id(),
                             idx,
@@ -750,40 +741,17 @@ fn mark_shared_expressions_for_caching(
             }
         }
         Operator::Filter { .. } => unreachable!(),
-        Operator::SeekRowid {
-            id,
-            table,
-            table_identifier,
-            rowid_predicate,
-            predicates,
-            step,
-        } => {}
-        Operator::Limit {
-            id,
-            source,
-            limit,
-            step,
-        } => mark_shared_expressions_for_caching(source, expr_result_cache),
-        Operator::Join {
-            id,
-            left,
-            right,
-            predicates,
-            outer,
-            step,
-        } => {}
-        Operator::Order {
-            id,
-            source,
-            key,
-            step,
-        } => {
+        Operator::SeekRowid { .. } => {}
+        Operator::Limit { source, .. } => {
+            mark_shared_expressions_for_caching(source, expr_result_cache)
+        }
+        Operator::Join { .. } => {}
+        Operator::Order { source, key, .. } => {
             let mut idx = 0;
 
             for (expr, _) in key.iter() {
                 let result = find_identical_expression(&expr, source);
-                if result.is_some() {
-                    let result = result.unwrap();
+                if let Some(result) = result {
                     expr_result_cache.set_precomputation_key(
                         operator.id(),
                         idx,
@@ -794,19 +762,8 @@ fn mark_shared_expressions_for_caching(
                 idx += 1;
             }
         }
-        Operator::Projection {
-            id,
-            source,
-            expressions,
-            step,
-        } => {}
-        Operator::Scan {
-            id,
-            table,
-            table_identifier,
-            predicates,
-            step,
-        } => {}
+        Operator::Projection { .. } => {}
+        Operator::Scan { .. } => {}
         Operator::Nothing => {}
     }
 }
