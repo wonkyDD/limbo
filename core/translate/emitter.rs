@@ -1045,7 +1045,9 @@ impl Emitter for Operator {
                                 expr,
                                 key_reg,
                                 None,
-                                m.expr_result_cache.get_precomputed_result(*id, i).as_ref(),
+                                m.expr_result_cache
+                                    .get_cached_result_registers(*id, i)
+                                    .as_ref(),
                             )?;
                         }
 
@@ -1226,7 +1228,7 @@ impl Emitter for Operator {
                         register: agg_result_reg,
                         func: agg.func.clone(),
                     });
-                    m.expr_result_cache.set_computation_result(
+                    m.expr_result_cache.cache_result_register(
                         *id,
                         result_column_idx,
                         agg_result_reg,
@@ -1248,7 +1250,9 @@ impl Emitter for Operator {
                             agg,
                             agg_result_reg,
                             cursor_override.map(|c| c.cursor_id),
-                            m.expr_result_cache.get_precomputed_result(*id, i).as_ref(),
+                            m.expr_result_cache
+                                .get_cached_result_registers(*id, i)
+                                .as_ref(),
                         )?;
                         result_column_idx += 1;
                     }
@@ -1264,7 +1268,7 @@ impl Emitter for Operator {
                         amount: group_by.len() - 1,
                     });
                     for (i, source_expr) in group_by.iter().enumerate() {
-                        m.expr_result_cache.set_computation_result(
+                        m.expr_result_cache.cache_result_register(
                             *id,
                             result_column_idx + i,
                             output_row_start_reg + i,
@@ -1338,7 +1342,7 @@ impl Emitter for Operator {
                                 cur_reg,
                                 cursor_override.map(|c| c.cursor_id),
                                 m.expr_result_cache
-                                    .get_precomputed_result(*id, cur_reg - start_reg)
+                                    .get_cached_result_registers(*id, cur_reg - start_reg)
                                     .as_ref(),
                             )?;
                             cur_reg += 1;

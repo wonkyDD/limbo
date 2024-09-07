@@ -32,7 +32,7 @@ pub fn optimize_plan(mut select_plan: Plan) -> Result<(Plan, ExpressionResultCac
         &mut select_plan.root_operator,
         &select_plan.referenced_tables,
     )?;
-    mark_shared_expressions_for_caching(&select_plan.root_operator, &mut expr_result_cache);
+    find_shared_expressions_in_child_operators_and_mark_them_so_that_the_parent_operator_doesnt_recompute_them(&select_plan.root_operator, &mut expr_result_cache);
     Ok((select_plan, expr_result_cache))
 }
 
@@ -540,8 +540,7 @@ pub struct CachedResult {
     pub source_expr: ast::Expr,
 }
 
-const DEPENDENCY_OPERATOR_ID_MULTIPLIER: usize = 100000000;
-const DEPENDENT_OPERATOR_ID_MULTIPLIER: usize = 10000;
+const OPERATOR_ID_MULTIPLIER: usize = 10000;
 
 impl ExpressionResultCache {
     pub fn new() -> Self {
@@ -551,14 +550,14 @@ impl ExpressionResultCache {
         }
     }
 
-    pub fn set_computation_result(
+    pub fn cache_result_register(
         &mut self,
         operator_id: usize,
         result_column_idx: usize,
         register_idx: usize,
         expr: ast::Expr,
     ) {
-        let key = operator_id * DEPENDENCY_OPERATOR_ID_MULTIPLIER + result_column_idx;
+        let key = operator_id * OPERATOR_ID_MULTIPLIER + result_column_idx;
         self.resultmap.insert(
             key,
             CachedResult {
@@ -575,23 +574,23 @@ impl ExpressionResultCache {
         child_operator_id: usize,
         child_operator_result_column_idx_mask: usize,
     ) -> () {
-        let key = operator_id * DEPENDENT_OPERATOR_ID_MULTIPLIER + result_column_idx;
+        let key = operator_id * OPERATOR_ID_MULTIPLIER + result_column_idx;
 
         let mut values = Vec::new();
         for i in 0..64 {
             if (child_operator_result_column_idx_mask >> i) & 1 == 1 {
-                values.push(child_operator_id * DEPENDENCY_OPERATOR_ID_MULTIPLIER + i);
+                values.push(child_operator_id * OPERATOR_ID_MULTIPLIER + i);
             }
         }
         self.keymap.insert(key, values);
     }
 
-    pub fn get_precomputed_result(
+    pub fn get_cached_result_registers(
         &self,
         operator_id: usize,
         result_column_idx: usize,
     ) -> Option<Vec<&CachedResult>> {
-        let key = operator_id * DEPENDENT_OPERATOR_ID_MULTIPLIER + result_column_idx;
+        let key = operator_id * OPERATOR_ID_MULTIPLIER + result_column_idx;
         self.keymap.get(&key).and_then(|keys| {
             let mut results = Vec::new();
             for key in keys {
@@ -610,7 +609,10 @@ impl ExpressionResultCache {
 
 type ResultColumnIndexBitmask = usize;
 
-fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> ResultColumnIndexBitmask {
+fn find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(
+    expr: &ast::Expr,
+    operator: &Operator,
+) -> ResultColumnIndexBitmask {
     let exact_match = match operator {
         Operator::Aggregate {
             aggregates,
@@ -676,15 +678,15 @@ fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> ResultCol
             end,
         } => {
             let mut mask = 0;
-            mask |= find_identical_expression(lhs, operator);
-            mask |= find_identical_expression(start, operator);
-            mask |= find_identical_expression(end, operator);
+            mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(lhs, operator);
+            mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(start, operator);
+            mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(end, operator);
             mask
         }
         ast::Expr::Binary(lhs, op, rhs) => {
             let mut mask = 0;
-            mask |= find_identical_expression(lhs, operator);
-            mask |= find_identical_expression(rhs, operator);
+            mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(lhs, operator);
+            mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(rhs, operator);
             mask
         }
         ast::Expr::Case {
@@ -694,22 +696,26 @@ fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> ResultCol
         } => {
             let mut mask = 0;
             if let Some(base) = base {
-                mask |= find_identical_expression(base, operator);
+                mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(base, operator);
             }
             for (w, t) in when_then_pairs.iter() {
-                mask |= find_identical_expression(w, operator);
-                mask |= find_identical_expression(t, operator);
+                mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(w, operator);
+                mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(t, operator);
             }
             if let Some(e) = else_expr {
-                mask |= find_identical_expression(e, operator);
+                mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(e, operator);
             }
             mask
         }
         ast::Expr::Cast { expr, type_name } => {
-            find_identical_expression(expr, operator)
+            find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(
+                expr, operator,
+            )
         }
         ast::Expr::Collate(expr, collation) => {
-            find_identical_expression(expr, operator)
+            find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(
+                expr, operator,
+            )
         }
         ast::Expr::DoublyQualified(schema, tbl, ident) => 0,
         ast::Expr::Exists(_) => 0,
@@ -723,7 +729,7 @@ fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> ResultCol
             let mut mask = 0;
             if let Some(args) = args {
                 for a in args.iter() {
-                    mask |= find_identical_expression(a, operator);
+                    mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(a, operator);
                 }
             }
             mask
@@ -732,22 +738,30 @@ fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> ResultCol
         ast::Expr::Id(_) => 0,
         ast::Expr::InList { lhs, not, rhs } => {
             let mut mask = 0;
-            mask |= find_identical_expression(lhs, operator);
+            mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(lhs, operator);
             if let Some(rhs) = rhs {
                 for r in rhs.iter() {
-                    mask |= find_identical_expression(r, operator);
+                    mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(r, operator);
                 }
             }
             mask
         }
-        ast::Expr::InSelect { lhs, not, rhs } => find_identical_expression(lhs, operator),
+        ast::Expr::InSelect { lhs, not, rhs } => {
+            find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(
+                lhs, operator,
+            )
+        }
         ast::Expr::InTable {
             lhs,
             not,
             rhs,
             args,
         } => 0,
-        ast::Expr::IsNull(expr) => find_identical_expression(expr, operator),
+        ast::Expr::IsNull(expr) => {
+            find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(
+                expr, operator,
+            )
+        }
         ast::Expr::Like {
             lhs,
             not,
@@ -756,29 +770,37 @@ fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> ResultCol
             escape,
         } => {
             let mut mask = 0;
-            mask |= find_identical_expression(lhs, operator);
-            mask |= find_identical_expression(rhs, operator);
+            mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(lhs, operator);
+            mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(rhs, operator);
             mask
         }
         ast::Expr::Literal(_) => 0,
         ast::Expr::Name(_) => 0,
-        ast::Expr::NotNull(expr) => find_identical_expression(expr, operator),
+        ast::Expr::NotNull(expr) => {
+            find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(
+                expr, operator,
+            )
+        }
         ast::Expr::Parenthesized(expr) => {
             let mut mask = 0;
             for e in expr.iter() {
-                mask |= find_identical_expression(e, operator);
+                mask |= find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(e, operator);
             }
             mask
         }
         ast::Expr::Qualified(_, _) => 0,
         ast::Expr::Raise(_, _) => 0,
         ast::Expr::Subquery(_) => 0,
-        ast::Expr::Unary(op, expr) => find_identical_expression(expr, operator),
+        ast::Expr::Unary(op, expr) => {
+            find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(
+                expr, operator,
+            )
+        }
         ast::Expr::Variable(_) => 0,
     }
 }
 
-fn mark_shared_expressions_for_caching(
+fn find_shared_expressions_in_child_operators_and_mark_them_so_that_the_parent_operator_doesnt_recompute_them(
     operator: &Operator,
     expr_result_cache: &mut ExpressionResultCache,
 ) {
@@ -791,7 +813,7 @@ fn mark_shared_expressions_for_caching(
             ..
         } => {
             for (idx, result_expr) in aggregate_result_exprs.iter().enumerate() {
-                let result = find_identical_expression(result_expr, operator);
+                let result = find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(result_expr, operator);
                 if result != 0 {
                     expr_result_cache.set_precomputation_key(
                         operator.id(),
@@ -805,14 +827,14 @@ fn mark_shared_expressions_for_caching(
         Operator::Filter { .. } => unreachable!(),
         Operator::SeekRowid { .. } => {}
         Operator::Limit { source, .. } => {
-            mark_shared_expressions_for_caching(source, expr_result_cache)
+            find_shared_expressions_in_child_operators_and_mark_them_so_that_the_parent_operator_doesnt_recompute_them(source, expr_result_cache)
         }
         Operator::Join { .. } => {}
         Operator::Order { source, key, .. } => {
             let mut idx = 0;
 
             for (expr, _) in key.iter() {
-                let result = find_identical_expression(&expr, source);
+                let result = find_indexes_of_all_result_columns_in_operator_that_match_expr_either_fully_or_partially(&expr, source);
                 if result != 0 {
                     expr_result_cache.set_precomputation_key(
                         operator.id(),
