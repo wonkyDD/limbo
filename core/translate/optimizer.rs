@@ -596,7 +596,7 @@ impl ExpressionResultCache {
             let mut results = Vec::new();
             for key in keys {
                 if let Some(result) = self.resultmap.get(key) {
-                    results.push(result.clone());
+                    results.push(result);
                 }
             }
             if results.is_empty() {
@@ -608,7 +608,9 @@ impl ExpressionResultCache {
     }
 }
 
-fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> usize {
+type ResultColumnIndexBitmask = usize;
+
+fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> ResultColumnIndexBitmask {
     let exact_match = match operator {
         Operator::Aggregate {
             aggregates,
@@ -704,14 +706,10 @@ fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> usize {
             mask
         }
         ast::Expr::Cast { expr, type_name } => {
-            let mut mask = 0;
-            mask |= find_identical_expression(expr, operator);
-            mask
+            find_identical_expression(expr, operator)
         }
         ast::Expr::Collate(expr, collation) => {
-            let mut mask = 0;
-            mask |= find_identical_expression(expr, operator);
-            mask
+            find_identical_expression(expr, operator)
         }
         ast::Expr::DoublyQualified(schema, tbl, ident) => 0,
         ast::Expr::Exists(_) => 0,
@@ -792,8 +790,7 @@ fn mark_shared_expressions_for_caching(
             group_by,
             ..
         } => {
-            let mut idx = 0;
-            for result_expr in aggregate_result_exprs.iter() {
+            for (idx, result_expr) in aggregate_result_exprs.iter().enumerate() {
                 let result = find_identical_expression(result_expr, operator);
                 if result != 0 {
                     expr_result_cache.set_precomputation_key(
@@ -803,7 +800,6 @@ fn mark_shared_expressions_for_caching(
                         result,
                     );
                 }
-                idx += 1;
             }
         }
         Operator::Filter { .. } => unreachable!(),
