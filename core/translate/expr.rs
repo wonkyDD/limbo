@@ -536,6 +536,22 @@ pub fn translate_condition_expr(
     Ok(())
 }
 
+pub fn find_in_cache_or_alloc_reg(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    cached_results: Option<&Vec<&CachedResult>>,
+) -> (usize, bool) {
+    if let Some(cached_results) = cached_results {
+        if let Some(cached_result) = cached_results
+            .iter()
+            .find(|cached_result| cached_result.source_expr == *expr)
+        {
+            return (cached_result.register_idx, true);
+        }
+    }
+    (program.alloc_register(), false)
+}
+
 pub fn translate_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&[(Rc<BTreeTable>, String)]>,
@@ -558,23 +574,11 @@ pub fn translate_expr(
         }
     }
 
-    let mut find_in_cache_or_alloc_reg = |expr: &ast::Expr| -> (usize, bool) {
-        if let Some(cached_results) = cached_results {
-            if let Some(cached_result) = cached_results
-                .iter()
-                .find(|cached_result| cached_result.source_expr == *expr)
-            {
-                return (cached_result.register_idx, true);
-            }
-        }
-        (program.alloc_register(), false)
-    };
-
     match expr {
         ast::Expr::Between { .. } => todo!(),
         ast::Expr::Binary(e1, op, e2) => {
-            let (e1_reg, e1_was_cached) = find_in_cache_or_alloc_reg(e1);
-            let (e2_reg, e2_was_cached) = find_in_cache_or_alloc_reg(e2);
+            let (e1_reg, e1_was_cached) = find_in_cache_or_alloc_reg(program, e1, cached_results);
+            let (e2_reg, e2_was_cached) = find_in_cache_or_alloc_reg(program, e2, cached_results);
 
             if !e1_was_cached {
                 translate_expr(
