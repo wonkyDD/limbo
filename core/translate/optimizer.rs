@@ -528,41 +528,6 @@ fn push_predicate(
     }
 }
 
-/// A cache for storing and retrieving the results of common expression computations.
-///
-/// This struct is used to optimize query execution by caching the VM register indices
-/// where the results of evaluating expressions are stored. This is useful for expressions
-/// that are referenced multiple times across different operators in the AST / query plan.
-///
-/// Currently this is only used for caching the results of aggregate functions. In this example query:
-///
-/// SELECT t.foo, SUM(t.bar) FROM t GROUP BY t.foo ORDER BY SUM(t.bar)
-///
-/// the SUM(t.bar) expression is referenced twice: once in the SELECT clause and once in the ORDER BY clause.
-/// By caching the result of the SUM(t.bar) computation, we can avoid recomputing it when evaluating the ORDER BY clause;
-/// instead the ORDER operator can look up the register index where the result is stored and read the value from there.
-///
-/// The cache uses a hashmap to store the mapping between expression identifiers and their
-/// computed results. It has the following operations:
-/// 1. Mark an operator's result as being dependent on another operator's result.
-/// 2. Store the result of an expression computation.
-/// 3. Retrieve the result of an expression computation.
-///
-/// The expressions are identified by a combination of the operator ID and the result column index.
-/// The dependent operator IDs and dependency operator IDs are multiplied by a large constant to avoid key collisions.
-///
-/// An example of how the cache is used:
-///
-/// 1. Both the ORDER and AGGREGATE operators reference the same expression SUM(t.bar).
-/// 2. We pre-mark the ORDER operator as dependent on the AGGREGATE operator. This is done by calling
-///   `set_precomputation_key(ORDER_OPERATOR_ID, ORDER_OPERATOR_RESULT_COLUMN_IDX, AGGREGATE_OPERATOR_ID, AGGREGATE_OPERATOR_RESULT_COLUMN_IDX)`.
-/// 3. When the AGGREGATE operator computes the result of SUM(t.bar), it stores the result in the cache using the
-///  `set_computation_result(AGGREGATE_OPERATOR_ID, AGGREGATE_OPERATOR_RESULT_COLUMN_IDX, REGISTER_IDX)` method.
-/// 4. When the ORDER operator needs to evaluate the SUM(t.bar) expression, it calls `get_precomputed_result_register(ORDER_OPERATOR_ID, ORDER_OPERATOR_RESULT_COLUMN_IDX)`
-/// to retrieve the register index where the result is stored. If the result is not found, it evaluates the expression itself; otherwise it reads the value from the register.
-///
-/// The result column indices are based on an arbitrary convention, e.g for an Aggregate operator, the aggregates come
-/// first in the result columns, followed by the group by columns.
 #[derive(Debug)]
 pub struct ExpressionResultCache {
     resultmap: HashMap<usize, CachedResult>,
@@ -612,9 +577,6 @@ impl ExpressionResultCache {
     ) -> () {
         let key = operator_id * DEPENDENT_OPERATOR_ID_MULTIPLIER + result_column_idx;
 
-        // child_opeerator_result_column_idx_mask is a 64-bit integer where each bit represents a column index
-        // where the least significant bit represents column index 0 and the most significant bit represents column index 63.
-        // All of the set bits need to be separately inserted into the keymap.
         let mut values = Vec::new();
         for i in 0..64 {
             if (child_operator_result_column_idx_mask >> i) & 1 == 1 {
@@ -646,24 +608,6 @@ impl ExpressionResultCache {
     }
 }
 
-/// Searches for a common expression within an operator's structure.
-///
-/// This function examines the given expression against the operator's components
-/// (such as aggregates, group by clauses, or projection columns) to find a match.
-/// If a match is found, it returns the index of the matching component.
-/// Note that the index is relative to the operator's "result columns" which is based
-/// on an arbitrary convention, e.g for an Aggregate operator, the aggregates come
-/// first in the result columns, followed by the group by columns.
-///
-/// # Arguments
-///
-/// * `expr` - The expression to search for.
-/// * `operator` - The operator to search within.
-///
-/// # Returns
-///
-/// An `usize` representing a bitmap of the matching component's indexes,
-/// where the least significant bit represents the first component.
 fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> usize {
     let exact_match = match operator {
         Operator::Aggregate {
@@ -836,23 +780,6 @@ fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> usize {
     }
 }
 
-/// Marks common subexpressions within an operator tree for precomputation.
-///
-/// This function traverses the operator tree and identifies common subexpressions
-/// that can be computed once and cached. It then updates the `ExpressionResultCache` to store
-/// the mapping between these expressions and their computed results, allowing
-/// subsequent uses of the same expression to reuse the cached result instead of
-/// recomputing it.
-///
-/// # Arguments
-///
-/// * `operator` - The root operator of the query plan to optimize.
-/// * `expr_result_cache` - A mutable reference to the `ExpressionResultCache` to update.
-///
-/// This function is particularly useful for optimizing queries with repeated
-/// subexpressions, especially in aggregate and order-by clauses.
-///
-/// This function is not complete and only handles the Aggregate and Order operators for now.
 fn mark_shared_expressions_for_caching(
     operator: &Operator,
     expr_result_cache: &mut ExpressionResultCache,
