@@ -184,7 +184,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                                         });
 
                                         aggregate_result_exprs.push(expr);
-                                    },
+                                    }
                                     Ok(Func::Scalar(_)) => {
                                         scalar_expressions.push(ProjectionColumn::Column(
                                             ast::Expr::FunctionCallStar { name, filter_over },
