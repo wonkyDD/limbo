@@ -43,6 +43,7 @@ pub enum Operator {
         id: usize,
         source: Box<Operator>,
         aggregates: Vec<Aggregate>,
+        aggregate_result_exprs: Vec<ast::Expr>,
         group_by: Option<Vec<ast::Expr>>,
         step: usize,
     },
@@ -156,10 +157,10 @@ impl Operator {
     pub fn column_count(&self, referenced_tables: &[(Rc<BTreeTable>, String)]) -> usize {
         match self {
             Operator::Aggregate {
-                aggregates,
                 group_by,
+                aggregate_result_exprs,
                 ..
-            } => aggregates.len() + group_by.as_ref().map_or(0, |g| g.len()),
+            } => aggregate_result_exprs.len() + group_by.as_ref().map_or(0, |g| g.len()),
             Operator::Filter { source, .. } => source.column_count(referenced_tables),
             Operator::SeekRowid { table, .. } => table.columns.len(),
             Operator::Limit { source, .. } => source.column_count(referenced_tables),

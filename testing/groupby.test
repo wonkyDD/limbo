@@ -80,3 +80,28 @@ Aimee|33|24,9
 Alan|551|18,52,30,62,96,13,85,97,98
 Albert|369|99,80,41,7,64,7,26,41,4
 Alec|247|55,48,53,91}
+
+do_execsql_test group_by_complex_order_by {
+  select u.first_name, group_concat(u.last_name) from users u group by u.first_name order by -1 * length(group_concat(u.last_name)) limit 1;
+} {Michael|Love,Finley,Hurst,Molina,Williams,Brown,King,Whitehead,Ochoa,Davis,Rhodes,Mcknight,Reyes,Johnston,Smith,Young,Lopez,Roberts,Green,Cole,Lane,Wagner,Allen,Simpson,Schultz,Perry,Mendez,Gibson,Hale,Williams,Bradford,Johnson,Weber,Nunez,Walls,Gonzalez,Park,Blake,Vazquez,Garcia,Mathews,Pacheco,Johnson,Perez,Gibson,Sparks,Chapman,Tate,Dudley,Miller,Alvarado,Ward,Nguyen,Rosales,Flynn,Ball,Jones,Hoffman,Clarke,Rivera,Moore,Hardin,Dillon,Montgomery,Rodgers,Payne,Williams,Mueller,Hernandez,Ware,Yates,Grimes,Gilmore,Johnson,Clark,Rodriguez,Walters,Powell,Colon,Mccoy,Allen,Quinn,Dunn,Wilson,Thompson,Bradford,Hunter,Gilmore,Woods,Bennett,Collier,Ali,Herrera,Lawson,Garner,Perez,Brown,Pena,Allen,Davis,Washington,Jackson,Khan,Martinez,Blackwell,Lee,Parker,Lynn,Johnson,Benton,Leonard,Munoz,Alvarado,Mathews,Salazar,Nelson,Jones,Carpenter,Walter,Young,Coleman,Berry,Clark,Powers,Meyer,Lewis,Barton,Guzman,Schneider,Hernandez,Mclaughlin,Allen,Atkinson,Woods,Rivera,Jones,Gordon,Dennis,Yoder,Hunt,Vance,Nelson,Park,Barnes,Lang,Williams,Cervantes,Tran,Anderson,Todd,Gonzalez,Lowery,Sanders,Mccullough,Haley,Rogers,Perez,Watson,Weaver,Wise,Walter,Summers,Long,Chan,Williams,Mccoy,Duncan,Roy,West,Christensen,Cuevas,Garcia,Williams,Butler,Anderson,Armstrong,Villarreal,Boyer,Johnson,Dyer,Hurst,Wilkins,Mercer,Taylor,Montes,Mccarty,Gill,Rodriguez,Williams,Copeland,Hansen,Palmer,Alexander,White,Taylor,Bowers,Hughes,Gibbs,Myers,Kennedy,Sanchez,Bell,Wilson,Berry,Spears,Patton,Rose,Smith,Bowen,Nicholson,Stewart,Quinn,Powell,Delgado,Mills,Duncan,Phillips,Grant,Hatfield,Russell,Anderson,Reed,Mahoney,Mcguire,Ortega,Logan,Schmitt,Walker}
+
+do_execsql_test group_by_complex_order_by_2 {
+  select u.first_name, sum(u.age) from users u group by u.first_name order by -1 * sum(u.age) limit 10;
+} {Michael|11204
+David|8758
+Robert|8109
+Jennifer|7700
+John|7299
+Christopher|6397
+James|5921
+Joseph|5711
+Brian|5059
+William|5047}
+
+do_execsql_test group_by_and_binary_expression_that_depends_on_two_aggregates {
+  select u.first_name, sum(u.age) + count(1) from users u group by u.first_name limit 5;
+} {Aaron|2312
+Abigail|906
+Adam|1675
+Adrian|447
+Adriana|84}

@@ -23,6 +23,47 @@ impl OperatorIdCounter {
     }
 }
 
+fn resolve_aggregates(expr: &ast::Expr, aggs: &mut Vec<Aggregate>) {
+    match expr {
+        ast::Expr::FunctionCall { name, args, .. } => {
+            let args_count = if let Some(args) = &args {
+                args.len()
+            } else {
+                0
+            };
+            match Func::resolve_function(normalize_ident(name.0.as_str()).as_str(), args_count) {
+                Ok(Func::Agg(f)) => aggs.push(Aggregate {
+                    func: f,
+                    args: args.clone().unwrap_or_default(),
+                    original_expr: expr.clone(),
+                }),
+                _ => {
+                    if let Some(args) = args {
+                        for arg in args.iter() {
+                            resolve_aggregates(&arg, aggs);
+                        }
+                    }
+                }
+            }
+        }
+        ast::Expr::FunctionCallStar { name, .. } => {
+            match Func::resolve_function(normalize_ident(name.0.as_str()).as_str(), 0) {
+                Ok(Func::Agg(f)) => aggs.push(Aggregate {
+                    func: f,
+                    args: vec![],
+                    original_expr: expr.clone(),
+                }),
+                _ => {}
+            }
+        }
+        ast::Expr::Binary(lhs, _, rhs) => {
+            resolve_aggregates(lhs, aggs);
+            resolve_aggregates(rhs, aggs);
+        }
+        _ => {}
+    }
+}
+
 pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<Plan> {
     match select.body.select {
         ast::OneSelect::Select {
@@ -56,14 +97,13 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
 
             // Parse the SELECT clause to either a projection or an aggregation
             // depending on the presence of aggregate functions.
-            // Since GROUP BY is not supported yet, mixing aggregate and non-aggregate
-            // columns is not allowed.
             //
             // If there are no aggregate functions, we can simply project the columns.
             // For a simple SELECT *, the projection operator is skipped.
             let is_select_star = col_count == 1 && matches!(columns[0], ast::ResultColumn::Star);
             if !is_select_star {
                 let mut aggregate_expressions = Vec::new();
+                let mut aggregate_result_exprs = Vec::new();
                 let mut scalar_expressions = Vec::with_capacity(col_count);
                 for column in columns.clone() {
                     match column {
@@ -102,21 +142,31 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                                     normalize_ident(name.0.as_str()).as_str(),
                                     args_count,
                                 ) {
-                                    Ok(Func::Agg(f)) => aggregate_expressions.push(Aggregate {
-                                        func: f,
-                                        args: args.unwrap(),
-                                        original_expr: expr,
-                                    }),
+                                    Ok(Func::Agg(f)) => {
+                                        aggregate_expressions.push(Aggregate {
+                                            func: f,
+                                            args: args.unwrap(),
+                                            original_expr: expr.clone(),
+                                        });
+
+                                        aggregate_result_exprs.push(expr);
+                                    }
                                     Ok(_) => {
-                                        scalar_expressions.push(ProjectionColumn::Column(
-                                            ast::Expr::FunctionCall {
-                                                name,
-                                                distinctness,
-                                                args,
-                                                filter_over,
-                                                order_by,
-                                            },
-                                        ));
+                                        let curr_agg_count = aggregate_expressions.len();
+                                        resolve_aggregates(&expr, &mut aggregate_expressions);
+                                        if curr_agg_count == aggregate_expressions.len() {
+                                            scalar_expressions.push(ProjectionColumn::Column(
+                                                ast::Expr::FunctionCall {
+                                                    name,
+                                                    distinctness,
+                                                    args,
+                                                    filter_over,
+                                                    order_by,
+                                                },
+                                            ));
+                                        } else {
+                                            aggregate_result_exprs.push(expr);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -126,17 +176,31 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                                     normalize_ident(name.0.as_str()).as_str(),
                                     0,
                                 ) {
-                                    Ok(Func::Agg(f)) => aggregate_expressions.push(Aggregate {
-                                        func: f,
-                                        args: vec![],
-                                        original_expr: expr,
-                                    }),
+                                    Ok(Func::Agg(f)) => {
+                                        aggregate_expressions.push(Aggregate {
+                                            func: f,
+                                            args: vec![],
+                                            original_expr: expr.clone(),
+                                        });
+
+                                        aggregate_result_exprs.push(expr);
+                                    },
                                     Ok(Func::Scalar(_)) => {
                                         scalar_expressions.push(ProjectionColumn::Column(
                                             ast::Expr::FunctionCallStar { name, filter_over },
                                         ));
                                     }
                                     _ => {}
+                                }
+                            }
+                            ast::Expr::Binary(lhs, _, rhs) => {
+                                let curr_agg_count = aggregate_expressions.len();
+                                resolve_aggregates(&lhs, &mut aggregate_expressions);
+                                resolve_aggregates(&rhs, &mut aggregate_expressions);
+                                if curr_agg_count == aggregate_expressions.len() {
+                                    scalar_expressions.push(ProjectionColumn::Column(expr));
+                                } else {
+                                    aggregate_result_exprs.push(expr);
                                 }
                             }
                             _ => {
@@ -173,6 +237,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                     operator = Operator::Aggregate {
                         source: Box::new(operator),
                         aggregates: aggregate_expressions,
+                        aggregate_result_exprs,
                         group_by: group_by.map(|g| g.exprs), // TODO: support HAVING
                         id: operator_id_counter.get_next_id(),
                         step: 0,

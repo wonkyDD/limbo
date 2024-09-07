@@ -85,6 +85,12 @@ pub enum Insn {
         rhs: usize,
         dest: usize,
     },
+    // Multiply two registers and store the result in a third register.
+    Multiply {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
     // Compare two vectors of registers in reg(P1)..reg(P1+P3-1) (call this vector "A") and in reg(P2)..reg(P2+P3-1) ("B"). Save the result of the comparison for use by the next Jump instruct.
     Compare {
         start_reg_a: usize,
@@ -494,8 +500,111 @@ impl Program {
                         (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
                             state.registers[dest] = OwnedValue::Null;
                         }
+                        (OwnedValue::Agg(aggctx), other) | (other, OwnedValue::Agg(aggctx)) => {
+                            match other {
+                                OwnedValue::Null => {
+                                    state.registers[dest] = OwnedValue::Null;
+                                }
+                                OwnedValue::Integer(i) => match aggctx.final_value() {
+                                    OwnedValue::Float(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(acc + *i as f64);
+                                    }
+                                    OwnedValue::Integer(acc) => {
+                                        state.registers[dest] = OwnedValue::Integer(acc + i);
+                                    }
+                                    _ => {
+                                        todo!("{:?}", aggctx);
+                                    }
+                                },
+                                OwnedValue::Float(f) => match aggctx.final_value() {
+                                    OwnedValue::Float(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(acc + f);
+                                    }
+                                    OwnedValue::Integer(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(*acc as f64 + f);
+                                    }
+                                    _ => {
+                                        todo!("{:?}", aggctx);
+                                    }
+                                },
+                                OwnedValue::Agg(aggctx2) => {
+                                    let acc = aggctx.final_value();
+                                    let acc2 = aggctx2.final_value();
+                                    match (acc, acc2) {
+                                        (OwnedValue::Integer(acc), OwnedValue::Integer(acc2)) => {
+                                            state.registers[dest] = OwnedValue::Integer(acc + acc2);
+                                        }
+                                        (OwnedValue::Float(acc), OwnedValue::Float(acc2)) => {
+                                            state.registers[dest] = OwnedValue::Float(acc + acc2);
+                                        }
+                                        (OwnedValue::Integer(acc), OwnedValue::Float(acc2)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Float(*acc as f64 + acc2);
+                                        }
+                                        (OwnedValue::Float(acc), OwnedValue::Integer(acc2)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Float(acc + *acc2 as f64);
+                                        }
+                                        _ => {
+                                            todo!("{:?} {:?}", acc, acc2);
+                                        }
+                                    }
+                                }
+                                rest => unimplemented!("{:?}", rest),
+                            }
+                        }
                         _ => {
                             todo!();
+                        }
+                    }
+                    state.pc += 1;
+                }
+                Insn::Multiply { lhs, rhs, dest } => {
+                    let lhs = *lhs;
+                    let rhs = *rhs;
+                    let dest = *dest;
+                    match (&state.registers[lhs], &state.registers[rhs]) {
+                        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
+                            state.registers[dest] = OwnedValue::Integer(lhs * rhs);
+                        }
+                        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => {
+                            state.registers[dest] = OwnedValue::Float(lhs * rhs);
+                        }
+                        (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
+                            state.registers[dest] = OwnedValue::Null;
+                        }
+                        (OwnedValue::Agg(aggctx), other) | (other, OwnedValue::Agg(aggctx)) => {
+                            match other {
+                                OwnedValue::Null => {
+                                    state.registers[dest] = OwnedValue::Null;
+                                }
+                                OwnedValue::Integer(i) => match aggctx.final_value() {
+                                    OwnedValue::Float(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(acc * *i as f64);
+                                    }
+                                    OwnedValue::Integer(acc) => {
+                                        state.registers[dest] = OwnedValue::Integer(acc * i);
+                                    }
+                                    _ => {
+                                        todo!("{:?}", aggctx);
+                                    }
+                                },
+                                OwnedValue::Float(f) => match aggctx.final_value() {
+                                    OwnedValue::Float(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(acc * f);
+                                    }
+                                    OwnedValue::Integer(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(*acc as f64 * f);
+                                    }
+                                    _ => {
+                                        todo!("{:?}", aggctx);
+                                    }
+                                },
+                                rest => unimplemented!("{:?}", rest),
+                            }
+                        }
+                        others => {
+                            todo!("{:?}", others);
                         }
                     }
                     state.pc += 1;
@@ -1733,6 +1842,7 @@ fn exec_length(reg: &OwnedValue) -> OwnedValue {
             OwnedValue::Integer(reg.to_string().len() as i64)
         }
         OwnedValue::Blob(blob) => OwnedValue::Integer(blob.len() as i64),
+        OwnedValue::Agg(aggctx) => exec_length(&aggctx.final_value()),
         _ => reg.to_owned(),
     }
 }

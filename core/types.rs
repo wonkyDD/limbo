@@ -69,6 +69,21 @@ pub enum AggContext {
     GroupConcat(OwnedValue),
 }
 
+const NULL: OwnedValue = OwnedValue::Null;
+
+impl AggContext {
+    pub fn final_value(&self) -> &OwnedValue {
+        match self {
+            AggContext::Avg(acc, _count) => acc,
+            AggContext::Sum(acc) => acc,
+            AggContext::Count(count) => count,
+            AggContext::Max(max) => max.as_ref().unwrap_or(&NULL),
+            AggContext::Min(min) => min.as_ref().unwrap_or(&NULL),
+            AggContext::GroupConcat(s) => s,
+        }
+    }
+}
+
 impl std::cmp::PartialOrd<OwnedValue> for OwnedValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {

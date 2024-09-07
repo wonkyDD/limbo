@@ -118,7 +118,7 @@ pub struct SortCursorOverride {
 /// The Metadata struct holds various information and labels used during bytecode generation.
 /// It is used for maintaining state and control flow during the bytecode
 /// generation process.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Metadata {
     // labels for the instructions that terminate the execution when a conditional check evaluates to false. typically jumps to Halt, but can also jump to AggFinal if a parent in the tree is an aggregation
     termination_label_stack: Vec<BranchOffset>,
@@ -286,6 +286,7 @@ impl Emitter for Operator {
                             Some(referenced_tables),
                             rowid_predicate,
                             rowid_reg,
+                            None,
                             None,
                         )?;
                         let jump_label = m
@@ -581,6 +582,7 @@ impl Emitter for Operator {
                                     expr,
                                     key_reg,
                                     None,
+                                    None,
                                 )?;
                             }
                             for (i, agg) in aggregates.iter().enumerate() {
@@ -591,6 +593,7 @@ impl Emitter for Operator {
                                     Some(referenced_tables),
                                     expr,
                                     agg_reg,
+                                    None,
                                     None,
                                 )?;
                             }
@@ -711,6 +714,7 @@ impl Emitter for Operator {
                                     expr,
                                     group_reg,
                                     Some(pseudo_cursor),
+                                    None,
                                 )?;
                             }
 
@@ -808,6 +812,7 @@ impl Emitter for Operator {
                                     expr,
                                     key_reg,
                                     Some(pseudo_cursor),
+                                    None,
                                 )?;
                             }
 
@@ -1034,23 +1039,14 @@ impl Emitter for Operator {
 
                         for (i, (expr, _)) in key.iter().enumerate() {
                             let key_reg = start_reg + i;
-                            if let Some(cached_result_reg) =
-                                m.expr_result_cache.get_precomputed_result_register(*id, i)
-                            {
-                                program.emit_insn(Insn::Copy {
-                                    src_reg: cached_result_reg,
-                                    dst_reg: key_reg,
-                                    amount: 0,
-                                });
-                            } else {
-                                translate_expr(
-                                    program,
-                                    Some(referenced_tables),
-                                    expr,
-                                    key_reg,
-                                    None,
-                                )?;
-                            }
+                            translate_expr(
+                                program,
+                                Some(referenced_tables),
+                                expr,
+                                key_reg,
+                                None,
+                                m.expr_result_cache.get_precomputed_result(*id, i).as_ref(),
+                            )?;
                         }
 
                         let sort_metadata = m.sorts.get_mut(id).unwrap();
@@ -1217,6 +1213,7 @@ impl Emitter for Operator {
             Operator::Aggregate {
                 id,
                 aggregates,
+                aggregate_result_exprs,
                 group_by,
                 ..
             } => {
@@ -1233,8 +1230,28 @@ impl Emitter for Operator {
                         *id,
                         result_column_idx,
                         agg_result_reg,
+                        agg.original_expr.clone(),
                     );
                     result_column_idx += 1;
+                }
+
+                if aggregates.len() != aggregate_result_exprs.len()
+                    || aggregates
+                        .iter()
+                        .any(|agg| !aggregate_result_exprs.contains(&agg.original_expr))
+                {
+                    for (i, agg) in aggregate_result_exprs.iter().enumerate() {
+                        let agg_result_reg = *agg_start_reg + i;
+                        translate_expr(
+                            program,
+                            Some(referenced_tables),
+                            agg,
+                            agg_result_reg,
+                            cursor_override.map(|c| c.cursor_id),
+                            m.expr_result_cache.get_precomputed_result(*id, i).as_ref(),
+                        )?;
+                        result_column_idx += 1;
+                    }
                 }
 
                 if let Some(group_by) = group_by {
@@ -1246,11 +1263,12 @@ impl Emitter for Operator {
                         dst_reg: output_row_start_reg,
                         amount: group_by.len() - 1,
                     });
-                    for i in 0..group_by.len() {
+                    for (i, source_expr) in group_by.iter().enumerate() {
                         m.expr_result_cache.set_computation_result(
                             *id,
                             result_column_idx + i,
                             output_row_start_reg + i,
+                            source_expr.clone(),
                         );
                     }
                     program.emit_insn(Insn::Copy {
@@ -1301,7 +1319,9 @@ impl Emitter for Operator {
 
                 Ok(start_reg)
             }
-            Operator::Projection { expressions, .. } => {
+            Operator::Projection {
+                expressions, id, ..
+            } => {
                 let expr_count = expressions
                     .iter()
                     .map(|e| e.column_count(referenced_tables))
@@ -1317,6 +1337,9 @@ impl Emitter for Operator {
                                 expr,
                                 cur_reg,
                                 cursor_override.map(|c| c.cursor_id),
+                                m.expr_result_cache
+                                    .get_precomputed_result(*id, cur_reg - start_reg)
+                                    .as_ref(),
                             )?;
                             cur_reg += 1;
                         }
@@ -1436,7 +1459,12 @@ fn prologue(
     let metadata = Metadata {
         termination_label_stack: vec![halt_label],
         expr_result_cache: cache,
-        ..Default::default()
+        aggregation_start_registers: HashMap::new(),
+        group_bys: HashMap::new(),
+        left_joins: HashMap::new(),
+        next_row_labels: HashMap::new(),
+        rewind_labels: vec![],
+        sorts: HashMap::new(),
     };
 
     Ok((program, metadata, init_label, halt_label, start_offset))
@@ -1470,7 +1498,6 @@ pub fn emit_program(
     cache: ExpressionResultCache,
 ) -> Result<Program> {
     let (mut program, mut metadata, init_label, halt_label, start_offset) = prologue(cache)?;
-
     loop {
         match plan
             .root_operator

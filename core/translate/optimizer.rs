@@ -563,9 +563,16 @@ fn push_predicate(
 ///
 /// The result column indices are based on an arbitrary convention, e.g for an Aggregate operator, the aggregates come
 /// first in the result columns, followed by the group by columns.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ExpressionResultCache {
-    hashmap: HashMap<usize, usize>,
+    resultmap: HashMap<usize, CachedResult>,
+    keymap: HashMap<usize, Vec<usize>>,
+}
+
+#[derive(Debug)]
+pub struct CachedResult {
+    pub register_idx: usize,
+    pub source_expr: ast::Expr,
 }
 
 const DEPENDENCY_OPERATOR_ID_MULTIPLIER: usize = 100000000;
@@ -574,7 +581,8 @@ const DEPENDENT_OPERATOR_ID_MULTIPLIER: usize = 10000;
 impl ExpressionResultCache {
     pub fn new() -> Self {
         ExpressionResultCache {
-            hashmap: HashMap::new(),
+            resultmap: HashMap::new(),
+            keymap: HashMap::new(),
         }
     }
 
@@ -583,9 +591,16 @@ impl ExpressionResultCache {
         operator_id: usize,
         result_column_idx: usize,
         register_idx: usize,
+        expr: ast::Expr,
     ) {
         let key = operator_id * DEPENDENCY_OPERATOR_ID_MULTIPLIER + result_column_idx;
-        self.hashmap.insert(key, register_idx);
+        self.resultmap.insert(
+            key,
+            CachedResult {
+                register_idx,
+                source_expr: expr,
+            },
+        );
     }
 
     pub fn set_precomputation_key(
@@ -593,23 +608,41 @@ impl ExpressionResultCache {
         operator_id: usize,
         result_column_idx: usize,
         child_operator_id: usize,
-        child_operator_result_column_idx: usize,
+        child_operator_result_column_idx_mask: usize,
     ) -> () {
         let key = operator_id * DEPENDENT_OPERATOR_ID_MULTIPLIER + result_column_idx;
-        let value = child_operator_id * DEPENDENCY_OPERATOR_ID_MULTIPLIER
-            + child_operator_result_column_idx;
-        self.hashmap.insert(key, value);
+
+        // child_opeerator_result_column_idx_mask is a 64-bit integer where each bit represents a column index
+        // where the least significant bit represents column index 0 and the most significant bit represents column index 63.
+        // All of the set bits need to be separately inserted into the keymap.
+        let mut values = Vec::new();
+        for i in 0..64 {
+            if (child_operator_result_column_idx_mask >> i) & 1 == 1 {
+                values.push(child_operator_id * DEPENDENCY_OPERATOR_ID_MULTIPLIER + i);
+            }
+        }
+        self.keymap.insert(key, values);
     }
 
-    pub fn get_precomputed_result_register(
+    pub fn get_precomputed_result(
         &self,
         operator_id: usize,
         result_column_idx: usize,
-    ) -> Option<usize> {
+    ) -> Option<Vec<&CachedResult>> {
         let key = operator_id * DEPENDENT_OPERATOR_ID_MULTIPLIER + result_column_idx;
-        self.hashmap
-            .get(&key)
-            .and_then(|k| self.hashmap.get(k).copied())
+        self.keymap.get(&key).and_then(|keys| {
+            let mut results = Vec::new();
+            for key in keys {
+                if let Some(result) = self.resultmap.get(key) {
+                    results.push(result.clone());
+                }
+            }
+            if results.is_empty() {
+                None
+            } else {
+                Some(results)
+            }
+        })
     }
 }
 
@@ -629,19 +662,20 @@ impl ExpressionResultCache {
 ///
 /// # Returns
 ///
-/// An `Option<usize>` representing the index of the matching component if found,
-/// or `None` if no match is found.
-fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> Option<usize> {
-    match operator {
+/// An `usize` representing a bitmap of the matching component's indexes,
+/// where the least significant bit represents the first component.
+fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> usize {
+    let exact_match = match operator {
         Operator::Aggregate {
             aggregates,
             group_by,
             ..
         } => {
             let mut idx = 0;
+            let mut mask = 0;
             for agg in aggregates.iter() {
                 if agg.original_expr == *expr {
-                    return Some(idx);
+                    mask |= 1 << idx;
                 }
                 idx += 1;
             }
@@ -649,26 +683,27 @@ fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> Option<us
             if let Some(group_by) = group_by {
                 for g in group_by.iter() {
                     if g == expr {
-                        return Some(idx);
+                        mask |= 1 << idx;
                     }
                     idx += 1
                 }
             }
 
-            None
+            mask
         }
-        Operator::Filter { .. } => None,
-        Operator::SeekRowid { .. } => None,
-        Operator::Limit { .. } => None,
-        Operator::Join { .. } => None,
-        Operator::Order { .. } => None,
+        Operator::Filter { .. } => 0,
+        Operator::SeekRowid { .. } => 0,
+        Operator::Limit { .. } => 0,
+        Operator::Join { .. } => 0,
+        Operator::Order { .. } => 0,
         Operator::Projection { expressions, .. } => {
             let mut idx = 0;
+            let mut mask = 0;
             for e in expressions.iter() {
                 match e {
                     super::plan::ProjectionColumn::Column(c) => {
                         if c == expr {
-                            return Some(idx);
+                            mask |= 1 << idx;
                         }
                     }
                     super::plan::ProjectionColumn::Star => {}
@@ -677,10 +712,127 @@ fn find_identical_expression(expr: &ast::Expr, operator: &Operator) -> Option<us
                 idx += 1;
             }
 
-            None
+            mask
         }
-        Operator::Scan { .. } => None,
-        Operator::Nothing => None,
+        Operator::Scan { .. } => 0,
+        Operator::Nothing => 0,
+    };
+
+    if exact_match != 0 {
+        return exact_match;
+    }
+
+    match expr {
+        ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            let mut mask = 0;
+            mask |= find_identical_expression(lhs, operator);
+            mask |= find_identical_expression(start, operator);
+            mask |= find_identical_expression(end, operator);
+            mask
+        }
+        ast::Expr::Binary(lhs, op, rhs) => {
+            let mut mask = 0;
+            mask |= find_identical_expression(lhs, operator);
+            mask |= find_identical_expression(rhs, operator);
+            mask
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            let mut mask = 0;
+            if let Some(base) = base {
+                mask |= find_identical_expression(base, operator);
+            }
+            for (w, t) in when_then_pairs.iter() {
+                mask |= find_identical_expression(w, operator);
+                mask |= find_identical_expression(t, operator);
+            }
+            if let Some(e) = else_expr {
+                mask |= find_identical_expression(e, operator);
+            }
+            mask
+        }
+        ast::Expr::Cast { expr, type_name } => {
+            let mut mask = 0;
+            mask |= find_identical_expression(expr, operator);
+            mask
+        }
+        ast::Expr::Collate(expr, collation) => {
+            let mut mask = 0;
+            mask |= find_identical_expression(expr, operator);
+            mask
+        }
+        ast::Expr::DoublyQualified(schema, tbl, ident) => 0,
+        ast::Expr::Exists(_) => 0,
+        ast::Expr::FunctionCall {
+            name,
+            distinctness,
+            args,
+            order_by,
+            filter_over,
+        } => {
+            let mut mask = 0;
+            if let Some(args) = args {
+                for a in args.iter() {
+                    mask |= find_identical_expression(a, operator);
+                }
+            }
+            mask
+        }
+        ast::Expr::FunctionCallStar { name, filter_over } => 0,
+        ast::Expr::Id(_) => 0,
+        ast::Expr::InList { lhs, not, rhs } => {
+            let mut mask = 0;
+            mask |= find_identical_expression(lhs, operator);
+            if let Some(rhs) = rhs {
+                for r in rhs.iter() {
+                    mask |= find_identical_expression(r, operator);
+                }
+            }
+            mask
+        }
+        ast::Expr::InSelect { lhs, not, rhs } => find_identical_expression(lhs, operator),
+        ast::Expr::InTable {
+            lhs,
+            not,
+            rhs,
+            args,
+        } => 0,
+        ast::Expr::IsNull(expr) => find_identical_expression(expr, operator),
+        ast::Expr::Like {
+            lhs,
+            not,
+            op,
+            rhs,
+            escape,
+        } => {
+            let mut mask = 0;
+            mask |= find_identical_expression(lhs, operator);
+            mask |= find_identical_expression(rhs, operator);
+            mask
+        }
+        ast::Expr::Literal(_) => 0,
+        ast::Expr::Name(_) => 0,
+        ast::Expr::NotNull(expr) => find_identical_expression(expr, operator),
+        ast::Expr::Parenthesized(expr) => {
+            let mut mask = 0;
+            for e in expr.iter() {
+                mask |= find_identical_expression(e, operator);
+            }
+            mask
+        }
+        ast::Expr::Qualified(_, _) => 0,
+        ast::Expr::Raise(_, _) => 0,
+        ast::Expr::Subquery(_) => 0,
+        ast::Expr::Unary(op, expr) => find_identical_expression(expr, operator),
+        ast::Expr::Variable(_) => 0,
     }
 }
 
@@ -709,35 +861,22 @@ fn mark_shared_expressions_for_caching(
         Operator::Aggregate {
             source,
             aggregates,
+            aggregate_result_exprs,
             group_by,
             ..
         } => {
             let mut idx = 0;
-            for agg in aggregates.iter() {
-                let result = find_identical_expression(&agg.original_expr, source);
-                if let Some(result) = result {
+            for result_expr in aggregate_result_exprs.iter() {
+                let result = find_identical_expression(result_expr, operator);
+                if result != 0 {
                     expr_result_cache.set_precomputation_key(
                         operator.id(),
                         idx,
-                        source.id(),
+                        operator.id(),
                         result,
                     );
                 }
                 idx += 1;
-            }
-
-            if let Some(group_by) = group_by {
-                for g in group_by.iter() {
-                    let result = find_identical_expression(&g, source);
-                    if let Some(result) = result {
-                        expr_result_cache.set_precomputation_key(
-                            operator.id(),
-                            idx,
-                            source.id(),
-                            result,
-                        );
-                    }
-                }
             }
         }
         Operator::Filter { .. } => unreachable!(),
@@ -751,7 +890,7 @@ fn mark_shared_expressions_for_caching(
 
             for (expr, _) in key.iter() {
                 let result = find_identical_expression(&expr, source);
-                if let Some(result) = result {
+                if result != 0 {
                     expr_result_cache.set_precomputation_key(
                         operator.id(),
                         idx,
